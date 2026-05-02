@@ -1,0 +1,17 @@
+.{
+    .name = .humpty,
+    .version = "0.0.0",
+    .fingerprint = 0x9b6071cfdf7af287, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .eggenvector = .{
+            .url = "git+https://github.com/eggyengine/eggenvector#9877a9ba332dd63aa8654267259a99c6502066b0",
+            .hash = "eggenvector-0.0.0-UyZb9L8qAQC0RBeoVAuyQz6UnDAjp5BKFfIfRIdeDCUd",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
