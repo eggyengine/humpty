@@ -6,12 +6,15 @@ pub fn build(b: *std.Build) void {
 
     const mod = b.addModule("humpty", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
 
+    // --- imports ---
     const emath = b.dependency("eggenvector", .{
         .target = target,
         .optimize = optimize,
     });
 
     mod.addImport("eggenvector", emath.module("eggenvector"));
+
+    // ---------------
 
     const mod_tests = b.addTest(.{
         .root_module = mod,

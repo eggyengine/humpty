@@ -1,6 +1,6 @@
 .{
     .name = .humpty,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x9b6071cfdf7af287, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
