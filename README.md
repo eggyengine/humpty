@@ -1,6 +1,6 @@
 # humpty
 
-*humpty* is a physics library written in Zig. 
+*humpty* is a physics library written in Zig and for the eggy engine project. 
 
 ## add to project
 requires zig `0.16.0` (have not tested for other zig versions, however likely works fine. please open a PR to reduce down the minimum version). 
