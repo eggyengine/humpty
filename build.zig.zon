@@ -4,6 +4,10 @@
     .fingerprint = 0x9b6071cfdf7af287, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .clutch = .{
+            .url = "git+https://github.com/eggyengine/clutch#1d5e64db3f779b907391d7142aa63a19b4ece4ec",
+            .hash = "clutch-0.1.0-gpdHb-t7AQBdjeoFzKaa22gbIDJyQqyNQr9wI5waI9-i",
+        },
         .eggenvector = .{
             .url = "git+https://github.com/eggyengine/eggenvector#0090788fd2de5151577ae15000bd0f954f51e0ed",
             .hash = "eggenvector-0.0.0-UyZb9CMkAgCXysMEx0f2nRlTRCMzRwo32F1vsDULsLYV",

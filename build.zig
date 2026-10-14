@@ -14,6 +14,11 @@ pub fn build(b: *std.Build) void {
     });
 
     mod.addImport("eggenvector", emath.module("eggenvector"));
+    const clutch = b.dependency("clutch", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("clutch", clutch.module("clutch"));
 
     // ---------------
 
