@@ -7,7 +7,7 @@ requires zig `0.16.0` (have not tested for other zig versions, however likely wo
 
 to use this with the zig build system, import as so:
 ```bash
-zig fetch --save git+https://github.com/eggyengine/humpty
+zig fetch --save git+https://github.com/eggyengine/humpty#0.16.0
 ```
 
 and then in `build.zig`:
