@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .clutch = .{
-            .url = "git+https://github.com/eggyengine/clutch#e64187edfacfa6b0af4be119154fbea466273f11",
-            .hash = "clutch-0.1.0-gpdHb78fAgAwkt43rVE3VrwWbkZbsDlfvNZ1yyQH3Ge6",
+            .url = "git+https://github.com/eggyengine/clutch#ca6b3fb364fcdb1326a6c78204f35bff2ec7de40",
+            .hash = "clutch-0.1.0-gpdHb6kfAgA7WgAGO251ESX_fPv9AiTHfi_Fyzd-IaYN",
         },
         .eggenvector = .{
             .url = "git+https://github.com/eggyengine/eggenvector#67b5b202495539bb34aec9941aec3ad24b5752ec",
