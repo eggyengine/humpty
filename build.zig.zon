@@ -2,15 +2,15 @@
     .name = .humpty,
     .version = "0.1.0",
     .fingerprint = 0x9b6071cfdf7af287, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .clutch = .{
-            .url = "git+https://github.com/eggyengine/clutch#c12badcbfdcc8312e83065af5e05782de21447b1",
-            .hash = "clutch-0.1.0-gpdHb3UnAgCWabyJxv47U4CZvOQk4Tyio5OxV5CaoG3n",
+            .url = "git+https://github.com/eggyengine/clutch#e64187edfacfa6b0af4be119154fbea466273f11",
+            .hash = "clutch-0.1.0-gpdHb78fAgAwkt43rVE3VrwWbkZbsDlfvNZ1yyQH3Ge6",
         },
         .eggenvector = .{
-            .url = "git+https://github.com/eggyengine/eggenvector#0090788fd2de5151577ae15000bd0f954f51e0ed",
-            .hash = "eggenvector-0.0.0-UyZb9CMkAgCXysMEx0f2nRlTRCMzRwo32F1vsDULsLYV",
+            .url = "git+https://github.com/eggyengine/eggenvector#67b5b202495539bb34aec9941aec3ad24b5752ec",
+            .hash = "eggenvector-0.0.0-UyZb9BwkAgBS9Aa5WxM4mo9UPk19qgXX44kkfEmyNxt3",
         },
     },
     .paths = .{
