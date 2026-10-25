@@ -3,11 +3,11 @@
 *humpty* is a physics library written in Zig and for the eggy engine project. 
 
 ## add to project
-requires zig `0.16.0` (have not tested for other zig versions, however likely works fine. please open a PR to reduce down the minimum version). 
+requires zig `0.17.0`. 
 
 to use this with the zig build system, import as so:
 ```bash
-zig fetch --save git+https://github.com/eggyengine/humpty#0.16.0
+zig fetch --save git+https://github.com/eggyengine/humpty
 ```
 
 and then in `build.zig`:
