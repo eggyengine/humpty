@@ -7,6 +7,9 @@ pub const BodyHandle = math.Handle(.body);
 /// kinematic ones move at the velocity they are given and push dynamic ones aside.
 pub const BodyKind = enum { static, dynamic, kinematic };
 
+/// Whether contacts and impulses can turn a body; a locked one only slides, as a character does.
+pub const Rotation = enum { free, locked };
+
 /// Bodies in space `S` (a `space.Space`).
 pub fn Bodies(comptime S: type) type {
     const T = S.Real;
@@ -23,6 +26,7 @@ pub fn Bodies(comptime S: type) type {
             angular_damping: T = 0,
             /// How strongly gravity pulls it: 0 floats, 1 falls as everything else does.
             gravity_scale: T = 1,
+            rotation: Rotation = .free,
             linear_velocity: Vec = .zero,
             angular_velocity: S.Angular = S.angular_zero,
         };
@@ -39,6 +43,7 @@ pub fn Bodies(comptime S: type) type {
             linear_damping: T,
             angular_damping: T,
             gravity_scale: T,
+            rotation: Rotation = .free,
             /// How long it has been nearly still, in seconds.
             still_s: T = 0,
             sleeping: bool = false,
@@ -54,6 +59,7 @@ pub fn Bodies(comptime S: type) type {
                     .linear_damping = body.linear_damping,
                     .angular_damping = body.angular_damping,
                     .gravity_scale = body.gravity_scale,
+                    .rotation = body.rotation,
                 };
             }
 
@@ -68,7 +74,7 @@ pub fn Bodies(comptime S: type) type {
             }
 
             pub fn setInertia(self: *State, inertia: S.Inertia) void {
-                self.inv_inertia = if (self.inv_mass > 0) S.invert(inertia) else S.angular_zero;
+                self.inv_inertia = if (self.inv_mass > 0 and self.rotation == .free) S.invert(inertia) else S.angular_zero;
             }
 
             /// The angular velocity change a world-space angular impulse makes.

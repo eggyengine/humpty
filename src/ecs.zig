@@ -4,7 +4,7 @@
 //! right after `Update`, build and rebuild what changed, step, move the host's transforms, and
 //! report collisions as `CollidingEntities`, the resource's `started`/`ended` lists and events.
 //!
-//!     humpty.ecs.Plugin(.three, f32, MyHost).install(&world, gpa);
+//!     try humpty.ecs.Plugin(.three, f32, MyHost).install(&world, gpa, .{});
 //!
 //! The components are plain `f32` data, the same in 2D and 3D, so an editor can list and save
 //! them whatever the world is; 2D reads x and y, and turns about z.
@@ -13,23 +13,32 @@ const clutch = @import("clutch");
 const emath = @import("eggenvector");
 const physics_zig = @import("physics.zig");
 const space = @import("space.zig");
+const debug_draw = @import("debug_draw.zig");
 const BodyKind = @import("body.zig").BodyKind;
+const Rotation = @import("body.zig").Rotation;
 const BodyHandle = @import("body.zig").BodyHandle;
 const ColliderHandle = @import("collider.zig").ColliderHandle;
 
 const Vec3 = emath.Vec3;
 const log = std.log.scoped(.physics);
 
-pub const Precision = enum { f32, f64 };
+/// The scalar a world computes in: `f64` for worlds far bigger than a few kilometres.
+pub const Precision = enum {
+    f32,
+    f64,
 
-/// How a scene's physics runs. Put one on the scene's root entity; the world is built from the
-/// first found when physics starts, so `dimension` and `precision` take effect from then.
+    /// The Zig type it names.
+    pub fn Type(comptime self: Precision) type {
+        return if (self == .f32) f32 else f64;
+    }
+};
+
+/// How a scene's physics runs, read each step: put one on the scene's root entity. Whether it
+/// is 2D or 3D, and its precision, are the plugin's (`Plugin(dim, T, Host)`), not the scene's.
 pub const PhysicsSettings = struct {
     /// Marks it in the editor (nf-md-earth).
     pub const icon = "\u{f01e7}";
     pub const category = "Physics";
-    dimension: space.Dim = .three,
-    precision: Precision = .f32,
     gravity_mps2: Vec3 = .init(0, -9.81, 0),
     steps_per_second: f32 = 60,
 };
@@ -45,6 +54,8 @@ pub const RigidBody = struct {
     linear_damping: f32 = 0,
     angular_damping: f32 = 0,
     gravity_scale: f32 = 1,
+    /// Locked, it slides but never tips over: for characters.
+    rotation: Rotation = .free,
 };
 
 /// The shape its entity touches the world with. Alone, it is static scenery.
@@ -110,6 +121,13 @@ pub const CollidingEntities = struct {
     }
 };
 
+/// What a raycast leaves out.
+pub const RayFilter = struct {
+    /// This entity's own collider, such as the one casting from inside it.
+    exclude: ?clutch.EntityId = null,
+    sensors: enum { hit, skip } = .hit,
+};
+
 /// Sent when two entities' colliders start touching, and when they stop.
 pub const CollisionStarted = struct { a: clutch.EntityId, b: clutch.EntityId };
 pub const CollisionEnded = struct { a: clutch.EntityId, b: clutch.EntityId };
@@ -126,8 +144,10 @@ pub const PhysicsStage = struct {
 ///     pub const Transform: type             // the component placing an entity
 ///     pub const Time: type                  // a resource with the frame's length
 ///     pub fn deltaSeconds(time: *const Time) f32
-///     pub fn place(transform: Transform) Place
-///     pub fn setPlace(transform: *Transform, position: Vec3, rotation: emath.UnitQuat) void
+///     // Where `transform`, the entity's, puts it in the world, through any parents; and the
+///     // reverse, setting `transform` so the entity is at `position` turned by `rotation`.
+///     pub fn place(world: *clutch.World, entity: clutch.EntityId, transform: Transform) Place
+///     pub fn setPlace(world: *clutch.World, entity: clutch.EntityId, transform: *Transform, position: Vec3, rotation: emath.UnitQuat) void
 ///     // Optional, for `convex_hull_from_mesh` and `mesh`:
 ///     pub fn mesh(world: *clutch.World, entity: clutch.EntityId, gpa: Allocator) !?MeshSource
 pub const Place = struct { position: Vec3, rotation: emath.UnitQuat, scale: Vec3 };
@@ -168,9 +188,24 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
 
             pub const Hit = struct { entity: clutch.EntityId, point: Vec3, normal: Vec3, distance_m: f32 };
 
-            /// The nearest entity a ray from `origin` along unit `direction` meets.
-            pub fn raycast(self: *const Resource, origin: Vec3, direction: Vec3, max_distance_m: f32) ?Hit {
-                const hit = self.world.raycast(.{ .origin = toVec(origin), .direction = toVec(direction), .max_distance_m = max_distance_m }) orelse return null;
+            /// The nearest entity a ray from `origin` along unit `direction` meets, leaving out
+            /// what `filter` says.
+            pub fn raycast(self: *const Resource, origin: Vec3, direction: Vec3, max_distance_m: f32, filter: RayFilter) ?Hit {
+                var query: World.QueryFilter = .{ .sensors = switch (filter.sensors) {
+                    .hit => .hit,
+                    .skip => .skip,
+                } };
+                // An entity is left out by its body, or its lone collider when it has none.
+                if (filter.exclude) |entity| {
+                    const resource_world = &self.world;
+                    for (resource_world.colliders.entries.items, 0..) |entry, index| {
+                        const attached = entry.item orelse continue;
+                        if (attached.user_data != dataOf(entity)) continue;
+                        if (attached.parent) |body| query.exclude_body = body else query.exclude_collider = resource_world.colliders.handleAt(index);
+                        break;
+                    }
+                }
+                const hit = self.world.raycast(.{ .origin = toVec(origin), .direction = toVec(direction), .max_distance_m = max_distance_m }, query) orelse return null;
                 return .{
                     .entity = entityOf(self.world.colliderData(hit.collider)),
                     .point = fromVec(hit.point),
@@ -187,8 +222,9 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
             collider: ?ColliderHandle = null,
             rigid_body: ?RigidBody,
             source: Collider,
-            /// The transform as physics last left it; any other change is a move by the game.
-            transform: Host.Transform,
+            /// Where its transform put it in the world when physics last left it; any other place
+            /// is a move by the game, or by a parent.
+            place: Place,
             linear: Vec3 = .zero,
             angular: Vec3 = .zero,
         };
@@ -200,6 +236,56 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
             try world.addScheduleFallible(clutch.Schedule(PhysicsStage, .{ sync, unlinkOrphans, step, writeBack, report }));
             try world.addScheduleFallible(clutch.Schedule(.Deinit, .{teardown}));
             world.onRemove(Link, unlink);
+        }
+
+        /// Wireframes of the colliders on `only` (every entity with a `Collider` when null),
+        /// through `sink`: any value with `fn line(self, from: Vec3, to: Vec3, color: [4]f32) !void`.
+        /// Drawn from components and transforms, so it needs no running world (an editor between
+        /// plays); when one is running, sleeping bodies are drawn as sleeping. Shapes that can't
+        /// be built (a mesh not loaded yet) are skipped.
+        pub fn drawColliders(world: *clutch.World, only: ?[]const clutch.EntityId, gpa: std.mem.Allocator, sink: anytype) !void {
+            if (only) |entities| {
+                for (entities) |entity| try drawCollider(world, entity, gpa, sink);
+            } else {
+                var query = world.query(.{*const Collider});
+                while (query.next()) |view| try drawCollider(world, view.entity, gpa, sink);
+            }
+        }
+
+        /// The last step's contacts through `sink` (as `drawColliders` takes it): a cross at each
+        /// point, its normal drawn from it. Nothing without a running world.
+        pub fn drawContacts(world: *clutch.World, sink: anytype) !void {
+            const res = world.getResource(Resource) orelse return;
+            var lines: Lines(@TypeOf(sink)) = .{ .sink = sink };
+            for (res.world.contacts()) |contact| try debug_draw.DebugDraw(S).marker(contact.point, contact.normal, 0.1, debug_draw.palette.contact, &lines);
+        }
+
+        fn drawCollider(world: *clutch.World, entity: clutch.EntityId, gpa: std.mem.Allocator, sink: anytype) !void {
+            const collider = (world.get(entity, Collider) orelse return).*;
+            const transform = (world.get(entity, Host.Transform) orelse return).*;
+            const place = Host.place(world, entity, transform);
+            var shape = shapeOf(collider.shape, place.scale, world, entity, gpa) catch return;
+            defer shape.deinit(gpa);
+            const kind: ?BodyKind = if (world.get(entity, RigidBody)) |found| found.kind else null;
+            const color = debug_draw.palette.of(kind, sleeping(world, entity), collider.sensor);
+            var lines: Lines(@TypeOf(sink)) = .{ .sink = sink };
+            try debug_draw.DebugDraw(S).shape(shape.shape, poseOf(place).mul(offsetPose(collider, place.scale)), color, &lines);
+        }
+
+        fn sleeping(world: *clutch.World, entity: clutch.EntityId) bool {
+            const res = world.getResource(Resource) orelse return false;
+            const body = (world.get(entity, Link) orelse return false).body orelse return false;
+            return res.world.contains(body) and res.world.isSleeping(body);
+        }
+
+        /// A sink taking this space's vectors, passing them on as `Vec3`s.
+        fn Lines(comptime Sink: type) type {
+            return struct {
+                sink: Sink,
+                pub fn line(self: *@This(), from: S.Vec, to: S.Vec, color: debug_draw.Color) !void {
+                    try self.sink.line(fromVec(from), fromVec(to), color);
+                }
+            };
         }
 
         fn configOf(settings: PhysicsSettings) World.Config {
@@ -219,17 +305,17 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
                     try commands.addComponent(entity, build(res, world, entity, rigid_body, collider, transform));
                     continue;
                 };
-                const same = std.meta.eql(link.rigid_body, rigid_body) and std.meta.eql(link.source, collider) and
-                    Host.place(link.transform).scale.eql(Host.place(transform).scale);
+                const place = Host.place(world, entity, transform);
+                const same = std.meta.eql(link.rigid_body, rigid_body) and std.meta.eql(link.source, collider) and link.place.scale.eql(place.scale);
                 if (!same) {
                     drop(res, link.*);
                     link.* = build(res, world, entity, rigid_body, collider, transform);
                     continue;
                 }
-                if (!std.meta.eql(link.transform, transform)) {
-                    const pose = poseOf(Host.place(transform));
-                    if (link.body) |body| res.world.setPose(body, pose) else if (link.collider) |handle| res.world.setColliderPose(handle, pose.mul(offsetPose(collider, Host.place(transform).scale)));
-                    link.transform = transform;
+                if (!std.meta.eql(link.place, place)) {
+                    const pose = poseOf(place);
+                    if (link.body) |body| res.world.setPose(body, pose) else if (link.collider) |handle| res.world.setColliderPose(handle, pose.mul(offsetPose(collider, place.scale)));
+                    link.place = place;
                 }
                 const body = link.body orelse continue;
                 const linear = if (world.get(entity, LinearVelocity)) |v| v.value else link.linear;
@@ -269,15 +355,15 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
                 if (view.world.get(view.entity, AngularVelocity)) |v| v.value = link.angular;
                 if (link.rigid_body.?.kind == .static or res.world.isSleeping(body)) continue;
                 const transform = view.get(*Host.Transform);
-                const place = Host.place(transform.*);
+                const place = Host.place(view.world, view.entity, transform.*);
                 const pose = res.world.pose(body);
                 if (two) {
-                    Host.setPlace(transform, Vec3.init(@floatCast(pose.translation.x), @floatCast(pose.translation.y), place.position.z), emath.UnitQuat.fromAxisAngle(Vec3.unit_z, @floatCast(pose.rotation.angle())));
+                    Host.setPlace(view.world, view.entity, transform, Vec3.init(@floatCast(pose.translation.x), @floatCast(pose.translation.y), place.position.z), emath.UnitQuat.fromAxisAngle(Vec3.unit_z, @floatCast(pose.rotation.angle())));
                 } else {
-                    Host.setPlace(transform, fromVec(pose.translation), fromRotation(pose.rotation));
+                    Host.setPlace(view.world, view.entity, transform, fromVec(pose.translation), fromRotation(pose.rotation));
                 }
                 view.world.markChanged(view.entity, Host.Transform);
-                link.transform = transform.*;
+                link.place = Host.place(view.world, view.entity, transform.*);
             }
         }
 
@@ -338,8 +424,8 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
         /// A body (with a `RigidBody`) and a collider for `entity`. What can't be built is left
         /// null and logged; it is tried again when the entity's physics changes.
         fn build(res: *Resource, world: *clutch.World, entity: clutch.EntityId, rigid_body: ?RigidBody, collider: Collider, transform: Host.Transform) Link {
-            var link: Link = .{ .rigid_body = rigid_body, .source = collider, .transform = transform };
-            const place = Host.place(transform);
+            const place = Host.place(world, entity, transform);
+            var link: Link = .{ .rigid_body = rigid_body, .source = collider, .place = place };
             const pose = poseOf(place);
             const data = dataOf(entity);
             if (rigid_body) |found| {
@@ -352,6 +438,7 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
                     .linear_damping = found.linear_damping,
                     .angular_damping = found.angular_damping,
                     .gravity_scale = found.gravity_scale,
+                    .rotation = found.rotation,
                     .linear_velocity = toVec(link.linear),
                     .angular_velocity = toAngular(link.angular),
                 }, data) catch |err| {
@@ -486,10 +573,10 @@ const TestHost = struct {
     pub fn deltaSeconds(time: *const Time) f32 {
         return time.delta_s;
     }
-    pub fn place(transform: Transform) Place {
+    pub fn place(_: *clutch.World, _: clutch.EntityId, transform: Transform) Place {
         return .{ .position = transform.position, .rotation = transform.rotation, .scale = transform.scale };
     }
-    pub fn setPlace(transform: *Transform, position: Vec3, rotation: emath.UnitQuat) void {
+    pub fn setPlace(_: *clutch.World, _: clutch.EntityId, transform: *Transform, position: Vec3, rotation: emath.UnitQuat) void {
         transform.position = position;
         transform.rotation = rotation;
     }
@@ -509,7 +596,7 @@ test "an entity with a RigidBody falls onto a static Collider, and they collide"
         var world = clutch.World.init(gpa);
         defer world.deinit();
         try world.insertResource(TestHost.Time{ .delta_s = 1.0 / 60.0 });
-        try P.install(&world, gpa, .{ .dimension = variant[0] });
+        try P.install(&world, gpa, .{});
         defer world.runStage(.Deinit) catch {};
 
         const ground = try world.spawn(.{ TestHost.Transform{ .scale = .init(10, 1, 10) }, Collider{} });
@@ -557,4 +644,53 @@ test "a game setting a LinearVelocity throws the body" {
     world.get(ball, LinearVelocity).?.value = .init(6, 0, 0);
     try runFrames(&world, 30);
     try std.testing.expectApproxEqAbs(@as(f32, 3), world.get(ball, TestHost.Transform).?.position.x, 0.15);
+}
+
+test "a body with its rotation locked lands on an edge without tipping" {
+    const P = Plugin(.three, f32, TestHost);
+    var world = clutch.World.init(std.testing.allocator);
+    defer world.deinit();
+    try P.install(&world, std.testing.allocator, .{});
+    defer world.runStage(.Deinit) catch {};
+    try world.insertResource(TestHost.Time{ .delta_s = 1.0 / 60.0 });
+
+    _ = try world.spawn(.{ TestHost.Transform{}, Collider{ .shape = .{ .half_space = .{} } } });
+    const tilted = emath.UnitQuat.fromAxisAngle(Vec3.unit_z, std.math.pi / 4.0);
+    const crate = try world.spawn(.{ TestHost.Transform{ .position = .init(0, 2, 0), .rotation = tilted }, Collider{}, RigidBody{ .rotation = .locked } });
+    try runFrames(&world, 180);
+    const rotation = world.get(crate, TestHost.Transform).?.rotation;
+    try std.testing.expectApproxEqAbs(@as(f32, 0), rotation.rotateVector(Vec3.unit_x).sub(tilted.rotateVector(Vec3.unit_x)).length(), 1e-3);
+    // Resting on its edge: half the diagonal up.
+    try std.testing.expectApproxEqAbs(@as(f32, @sqrt(0.5)), world.get(crate, TestHost.Transform).?.position.y, 0.03);
+}
+
+test "drawColliders draws a scaled, moved box without a running world, only for the entities asked" {
+    const P = Plugin(.three, f32, TestHost);
+    const gpa = std.testing.allocator;
+    var world = clutch.World.init(gpa);
+    defer world.deinit();
+
+    const crate = try world.spawn(.{ TestHost.Transform{ .position = .init(10, 0, 0), .scale = .init(2, 1, 1) }, Collider{}, RigidBody{} });
+    _ = try world.spawn(.{ TestHost.Transform{}, Collider{ .shape = .{ .ball = .{} } } });
+
+    const Sink = struct {
+        lines: usize = 0,
+        min_x: f32 = std.math.inf(f32),
+        color: [4]f32 = undefined,
+        pub fn line(self: *@This(), from: Vec3, to: Vec3, color: [4]f32) !void {
+            self.lines += 1;
+            self.min_x = @min(self.min_x, from.x, to.x);
+            self.color = color;
+        }
+    };
+    var sink = Sink{};
+    try P.drawColliders(&world, &.{crate}, gpa, &sink);
+    // Twelve edges, the nearest at 10 - 0.5 * 2, in the dynamic colour.
+    try std.testing.expectEqual(@as(usize, 12), sink.lines);
+    try std.testing.expectApproxEqAbs(@as(f32, 9), sink.min_x, 1e-4);
+    try std.testing.expectEqual(debug_draw.palette.dynamic, sink.color);
+
+    sink = .{};
+    try P.drawColliders(&world, null, gpa, &sink);
+    try std.testing.expect(sink.lines > 12);
 }

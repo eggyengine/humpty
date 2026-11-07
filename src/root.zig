@@ -1,6 +1,7 @@
 //! humpty: rigid-body physics in 2D and 3D, in `f32` or `f64`, after Rapier and Avian. A world
 //! (`Physics`) owns bodies and the colliders they touch it with; `ecs` runs one inside a clutch
-//! world, its bodies and colliders components of the entities they belong to.
+//! world, its bodies and colliders components of the entities they belong to; `debug_draw`
+//! turns shapes into lines for whatever renders them. It needs no engine.
 const std = @import("std");
 pub const emath = @import("eggenvector");
 
@@ -12,9 +13,11 @@ pub const Physics2 = Physics(.two, f32);
 pub const Physics3 = Physics(.three, f32);
 pub const BodyHandle = @import("body.zig").BodyHandle;
 pub const BodyKind = @import("body.zig").BodyKind;
+pub const Rotation = @import("body.zig").Rotation;
 pub const ColliderHandle = @import("collider.zig").ColliderHandle;
 pub const shapes = @import("shapes.zig");
 pub const ecs = @import("ecs.zig");
+pub const debug_draw = @import("debug_draw.zig");
 
 /// The whole API at once, for any 3D precision: a ball and a crate dropped on the ground
 /// settle, touch it, sleep, and can be found by a ray.
@@ -66,11 +69,19 @@ fn dropOnGround(comptime T: type) !void {
         .origin = ball_pose.translation.add(Vec.init(0, 5, 0)),
         .direction = Vec.init(0, -1, 0),
         .max_distance_m = 100,
-    }) orelse return error.TestExpectedHit;
+    }, .{}) orelse return error.TestExpectedHit;
     try std.testing.expectEqual(ball_shape, hit.collider);
     try std.testing.expectEqual(@as(?BodyHandle, ball), world.colliderBody(hit.collider));
     try std.testing.expectEqual(@as(u64, 1), world.colliderData(hit.collider));
     try std.testing.expectApproxEqAbs(@as(T, 4.5), hit.distance_m, 0.01);
+
+    // Leaving the ball out, the same ray reaches the ground beneath it.
+    const past = world.raycast(.{
+        .origin = ball_pose.translation.add(Vec.init(0, 5, 0)),
+        .direction = Vec.init(0, -1, 0),
+        .max_distance_m = 100,
+    }, .{ .exclude_body = ball }) orelse return error.TestExpectedHit;
+    try std.testing.expectEqual(ground, past.collider);
 
     // Removing a body takes its colliders with it, and its handle goes stale rather than
     // pointing at a reused slot.

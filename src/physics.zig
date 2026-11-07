@@ -9,6 +9,7 @@ const shapes_zig = @import("shapes.zig");
 const narrowphase_zig = @import("narrowphase.zig");
 const solver_zig = @import("solver.zig");
 const ray_zig = @import("ray.zig");
+const debug_draw = @import("debug_draw.zig");
 const Slots = @import("slots.zig").Slots;
 
 /// A world in `dim` dimensions with scalar `T` (`f32` or `f64`).
@@ -59,7 +60,9 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
         pub const Pair = struct { a: c.ColliderHandle, b: c.ColliderHandle };
 
         pub const Config = struct {
+            /// m/s², world space: `.init(0, -9.81, 0)` for Earth with y up.
             gravity: Vec,
+            /// How long each step is: `1.0 / 60.0` steps sixty times a second of game time.
             fixed_step_s: T,
         };
 
@@ -215,6 +218,9 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
             return self.bodies.get(body).?.user_data;
         }
 
+        /// Advances the world by a frame of `frame_dt_s` seconds, in as many fixed steps as fit
+        /// (the remainder carries to the next frame, and a long frame is capped so a stall
+        /// doesn't run away). Contacts and started/ended pairs are the last step's.
         pub fn update(self: *Self, frame_dt_s: T) !void {
             self.accumulator_s += @min(frame_dt_s, max_frame_dt_s);
             while (self.accumulator_s >= self.config.fixed_step_s) {
@@ -438,11 +444,56 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
             return self.ended_list.items;
         }
 
-        /// The nearest collider `ray` meets, as things stand now.
-        pub fn raycast(self: *const Self, ray: Ray) ?RayHit {
+        /// What `debugDraw` draws.
+        pub const DebugDrawOptions = struct {
+            colliders: bool = true,
+            /// The last step's contacts: a cross at each point, its normal drawn from it.
+            contacts: bool = true,
+            /// A contact marker's size.
+            marker_m: T = 0.1,
+        };
+
+        /// The world as wireframes through `sink` (see `debug_draw.DebugDraw`): each collider
+        /// in its `debug_draw.palette.of` colour where it is now, and the last step's contacts.
+        pub fn debugDraw(self: *const Self, options: DebugDrawOptions, sink: anytype) !void {
+            const Draw = debug_draw.DebugDraw(S);
+            if (options.colliders) for (self.colliders.entries.items) |entry| {
+                const attached = entry.item orelse continue;
+                const body = if (attached.parent) |parent| self.bodies.get(parent).?.item else null;
+                const placed_pose = if (body) |state| state.pose.mul(attached.item.local_pose) else attached.item.local_pose;
+                const color = debug_draw.palette.of(if (body) |state| state.kind else null, if (body) |state| state.sleeping else false, attached.item.sensor);
+                try Draw.shape(attached.item.shape, placed_pose, color, sink);
+            };
+            if (options.contacts) for (self.contact_list.items) |contact| {
+                try Draw.marker(contact.point, contact.normal, options.marker_m, debug_draw.palette.contact, sink);
+            };
+        }
+
+        /// Which colliders a query leaves out, as Rapier's `QueryFilter` does.
+        pub const QueryFilter = struct {
+            /// Every collider on this body, such as the one casting.
+            exclude_body: ?b.BodyHandle = null,
+            exclude_collider: ?c.ColliderHandle = null,
+            sensors: enum { hit, skip } = .hit,
+
+            fn passes(self: QueryFilter, handle: c.ColliderHandle, attached: Attached(Collider)) bool {
+                if (self.exclude_collider) |excluded| if (excluded == handle) return false;
+                if (self.exclude_body) |excluded| if (attached.parent) |parent| if (parent == excluded) return false;
+                return !(self.sensors == .skip and attached.item.sensor);
+            }
+        };
+
+        /// The nearest collider `ray` meets that `filter` lets through, as things stand now. A ray
+        /// starting inside a collider meets it at 0, so leave out the one casting it.
+        ///
+        /// ```zig
+        /// const below = world.raycast(.{ .origin = feet, .direction = down, .max_distance_m = 0.1 }, .{ .exclude_body = me });
+        /// ```
+        pub fn raycast(self: *const Self, ray: Ray, filter: QueryFilter) ?RayHit {
             var nearest: ?RayHit = null;
             for (self.colliders.entries.items, 0..) |entry, index| {
                 const attached = entry.item orelse continue;
+                if (!filter.passes(self.colliders.handleAt(index), attached)) continue;
                 const body_pose = if (attached.parent) |parent| self.bodies.get(parent).?.item.pose else null;
                 const placed_pose = if (body_pose) |p| p.mul(attached.item.local_pose) else attached.item.local_pose;
                 const hit = Rays.cast(ray, attached.item.shape, placed_pose) orelse continue;
