@@ -1,5 +1,8 @@
 # humpty
 
+> [!NOTE]
+> This repository has migrated to [git.tirbo.fish/eggy/humpty](https://git.tirbo.fish/eggy/humpty).
+
 *humpty* is a physics library written in Zig and for the eggy engine project. 
 
 ## add to project
@@ -7,7 +10,7 @@ requires zig `0.17.0`.
 
 to use this with the zig build system, import as so:
 ```bash
-zig fetch --save git+https://github.com/eggyengine/humpty
+zig fetch --save git+https://git.tirbo.fish/eggy/humpty
 ```
 
 and then in `build.zig`:
