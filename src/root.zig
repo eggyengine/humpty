@@ -1,105 +1,102 @@
 const std = @import("std");
-const emath = @import("eggenvector");
 const clutch = @import("clutch");
+pub const emath = @import("eggenvector");
 
-const Position = struct { value: emath.Vec2 };
-const Velocity = struct { value: emath.Vec2 };
+pub const eggy_types = @import("eggy.zig");
 
-const Time = struct {
-    delta_seconds: f32,
-};
+// imports
+const physics = @import("physics.zig");
+pub const Physics = physics.Physics;
+pub const Body = @import("body.zig").Body;
+pub const BodyHandle = @import("body.zig").BodyHandle;
+pub const Collider = @import("collider.zig").Collider;
+pub const Shape = @import("shapes.zig").Shape;
+pub const ColliderHandle = @import("collider.zig").ColliderHandle;
 
-const Gravity = struct { value: emath.Vec2 = .{ .x = 0.0, .y = -9.81 } };
+// The whole API at once: a ball and a crate dropped on the ground settle, touch it, sleep,
+// and can be found by a ray.
+test "main" {
+    const Vec3 = emath.Vec3;
+    const Pose = emath.Isometry3(f32);
+    const gpa = std.testing.allocator;
 
-const Force = struct {
-    value: emath.Vec2 = .zero,
-};
-
-const Mass = struct {
-    value: f32,
-};
-
-fn physicsStep(
-    query: clutch.Query(.{
-        *Position,
-        *Velocity,
-        *Force,
-        *Mass,
-    }),
-    time: clutch.Res(Time),
-    gravity: clutch.Res(Gravity),
-) !void {
-    const dt = time.delta_seconds;
-    const grav_force = gravity.value;
-
-    var iter = query;
-    while (iter.next()) |view| {
-        const position = &view.get(*Position).value;
-        const velocity = &view.get(*Velocity).value;
-        const force = &view.get(*Force).value;
-        const mass = &view.get(*Mass).value;
-
-        const acceleration = grav_force.add(force.div(emath.Vec2.splat(mass.*)));
-
-        velocity.x += acceleration.x * dt;
-        velocity.y += acceleration.y * dt;
-
-        position.x += velocity.x * dt;
-        position.y += velocity.y * dt;
-
-        force.* = emath.Vec2.zero;
-    }
-}
-
-fn applyThrust(query: clutch.Query(.{*Force})) !void {
-    var iter = query;
-    while (iter.next()) |view| {
-        const force = &view.get(*Force).value;
-        force.* = force.add(emath.Vec2.init(0, 20));
-    }
-}
-
-test "the ball is affected by gravity" {
-    var world = clutch.World.init(std.testing.allocator);
+    // The world owns every body; the game only ever holds handles.
+    var world = try Physics.init(gpa, .{
+        .gravity = Vec3.init(0, -9.81, 0),
+        .fixed_step_s = 1.0 / 60.0,
+    });
     defer world.deinit();
 
-    _ = try world.spawn(.{
-        Position{ .value = emath.Vec2.init(0, 100) },
-        Velocity{ .value = emath.Vec2.zero },
-        Force{ .value = emath.Vec2.zero },
-        Mass{ .value = 1.0 },
+    // Static scenery is a collider with no body: it never moves and costs nothing to step.
+    const ground = try world.addCollider(.{
+        .shape = .{ .plane = .{ .normal = Vec3.init(0, 1, 0), .offset = 0 } },
+    }, null);
+
+    const ball = try world.addBody(.{
+        .kind = .dynamic,
+        .pose = Pose.fromTranslation(Vec3.init(0, 10, 0)),
+        .mass_kg = 1.0,
     });
+    const ball_shape = try world.addCollider(.{
+        .shape = .{ .sphere = .{ .radius = 0.5 } },
+        .material = .{ .restitution = 0.2, .friction = 0.5 },
+    }, ball);
 
-    // world.addSchedule(clutch.Schedule(.Update, .{
-    //     applyThrust,
-    // }));
-    world.addSchedule(clutch.Schedule(.PostUpdate, .{physicsStep}));
+    // Tipped onto an edge so it has to rotate to settle flat.
+    const crate = try world.addBody(.{
+        .kind = .dynamic,
+        .pose = Pose.init(Vec3.init(3, 2, 0), Vec3.init(0, 0, std.math.pi / 4.0)),
+        .mass_kg = 10.0,
+    });
+    _ = try world.addCollider(.{ .shape = .{ .box = .{ .half_extents = Vec3.init(0.5, 0.5, 0.5) } } }, crate);
+    world.applyImpulse(crate, Vec3.init(-5, 0, 0), .{ .at_world_point = Vec3.init(3, 2.5, 0) });
 
-    const dt: f32 = 1.0 / 60.0;
-    try world.insertResource(Time{ .delta_seconds = dt });
-    try world.insertResource(Gravity{});
+    // Frames don't line up with the fixed step; the accumulator must absorb that.
+    for (0..10 * 144) |_| try world.update(1.0 / 144.0);
 
-    simulation: for (0..600) |step| {
-        try world.runStage(.Update);
-        try world.runStage(.PostUpdate);
-        world.tick();
+    // The ball rests on the plane: not sunk into it, not still bouncing, asleep.
+    const ball_pose = world.pose(ball);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), ball_pose.translation.y, 0.01);
+    try std.testing.expect(world.velocity(ball).linear.length() < 0.01);
+    try std.testing.expect(world.isSleeping(ball));
 
-        var query = world.query(.{*const Position});
-        while (query.next()) |view| {
-            const position = &view.get(*const Position).value;
-            const elapsed_seconds = @as(f32, @floatFromInt(step + 1)) * dt;
+    // The crate settled on a face, so its bottom sits on the ground.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), world.pose(crate).translation.y, 0.01);
+    try std.testing.expect(world.velocity(crate).angular.length() < 0.01);
 
-            if ((step + 1) % 60 == 0 or position.y <= 0.0) {
-                std.debug.print("t={d:.2}s: position=({d:.2}, {d:.2})\n", .{
-                    elapsed_seconds,
-                    position.x,
-                    position.y,
-                });
-            }
-
-            if (position.y <= 0) {
-                break :simulation;
-            }
-        }
+    // Contacts name both colliders, so games can react to them.
+    var touching_ground = false;
+    for (world.contacts()) |contact| {
+        if (contact.involves(ball_shape) and contact.involves(ground)) touching_ground = true;
     }
+    try std.testing.expect(touching_ground);
+
+    // A ray straight down from above the ball hits the ball first.
+    const hit = world.raycast(.{
+        .origin = ball_pose.translation.add(Vec3.init(0, 5, 0)),
+        .direction = Vec3.init(0, -1, 0),
+        .max_distance_m = 100,
+    }) orelse return error.TestExpectedHit;
+    try std.testing.expectEqual(ball_shape, hit.collider);
+    try std.testing.expectEqual(@as(?BodyHandle, ball), world.colliderBody(hit.collider));
+    try std.testing.expectApproxEqAbs(@as(f32, 4.5), hit.distance_m, 0.01);
+
+    // Removing a body takes its colliders with it, and its handle goes stale rather than
+    // pointing at a reused slot.
+    world.removeBody(ball);
+    try std.testing.expect(!world.contains(ball));
+    try std.testing.expect(!world.contains(ball_shape));
+    const replacement = try world.addBody(.{ .kind = .dynamic, .pose = Pose.identity(), .mass_kg = 1.0 });
+    try std.testing.expect(replacement != ball);
+    try std.testing.expect(!world.contains(ball));
+}
+
+test {
+    // Pulls in the tests written beside the code in physics.zig.
+    std.testing.refAllDecls(@This());
+    _ = physics;
+    _ = @import("slots.zig");
+    _ = @import("narrowphase.zig");
+    _ = @import("solver.zig");
+    _ = @import("ray.zig");
 }
