@@ -1,68 +1,96 @@
 //! Bodies: what moves. A body's shape comes from the colliders attached to it.
 const math = @import("math.zig");
-const Vec3 = math.emath.Vec3;
 
 pub const BodyHandle = math.Handle(.body);
 
-pub const Body = struct {
-    kind: BodyKind,
-    pose: math.Pose,
-    /// Spread over its colliders' shapes for inertia. Ignored for static bodies, which never move.
-    mass_kg: f32 = 0,
-};
+/// Static bodies never move; dynamic ones are pushed by gravity, contacts and impulses;
+/// kinematic ones move at the velocity they are given and push dynamic ones aside.
+pub const BodyKind = enum { static, dynamic, kinematic };
 
-pub const BodyKind = enum { static, dynamic };
+/// Bodies in space `S` (a `space.Space`).
+pub fn Bodies(comptime S: type) type {
+    const T = S.Real;
+    const Vec = S.Vec;
 
-/// A body as the world steps it: where it is, how it moves, and how hard it is to push.
-pub const State = struct {
-    kind: BodyKind,
-    pose: math.Pose,
-    inv_mass: f32,
-    /// Inverse principal moments in the body's own axes; zero on an axis it can't turn about.
-    inv_inertia: Vec3 = .zero,
-    linear: Vec3 = .zero,
-    angular: Vec3 = .zero,
-    /// How long it has been nearly still, in seconds.
-    still_s: f32 = 0,
-    sleeping: bool = false,
+    return struct {
+        pub const Body = struct {
+            kind: BodyKind,
+            pose: S.Pose,
+            /// Spread over its colliders' shapes for inertia. Only dynamic bodies have mass.
+            mass_kg: T = 0,
+            /// The share of its speed it loses each second, to air and the like.
+            linear_damping: T = 0,
+            angular_damping: T = 0,
+            /// How strongly gravity pulls it: 0 floats, 1 falls as everything else does.
+            gravity_scale: T = 1,
+            linear_velocity: Vec = .zero,
+            angular_velocity: S.Angular = S.angular_zero,
+        };
 
-    pub fn init(body: Body) State {
-        const dynamic = body.kind == .dynamic and body.mass_kg > 0;
-        return .{ .kind = body.kind, .pose = body.pose, .inv_mass = if (dynamic) 1 / body.mass_kg else 0 };
-    }
+        /// A body as the world steps it: where it is, how it moves, and how hard it is to push.
+        pub const State = struct {
+            kind: BodyKind,
+            pose: S.Pose,
+            inv_mass: T,
+            /// Inverse principal moments; zero where it can't turn.
+            inv_inertia: S.Inertia = S.angular_zero,
+            linear: Vec,
+            angular: S.Angular,
+            linear_damping: T,
+            angular_damping: T,
+            gravity_scale: T,
+            /// How long it has been nearly still, in seconds.
+            still_s: T = 0,
+            sleeping: bool = false,
 
-    /// Whether impulses move it: dynamic and awake.
-    pub fn moves(self: State) bool {
-        return self.kind == .dynamic and !self.sleeping;
-    }
+            pub fn init(body: Body) State {
+                const dynamic = body.kind == .dynamic and body.mass_kg > 0;
+                return .{
+                    .kind = body.kind,
+                    .pose = body.pose,
+                    .inv_mass = if (dynamic) 1 / body.mass_kg else 0,
+                    .linear = body.linear_velocity,
+                    .angular = body.angular_velocity,
+                    .linear_damping = body.linear_damping,
+                    .angular_damping = body.angular_damping,
+                    .gravity_scale = body.gravity_scale,
+                };
+            }
 
-    /// Sets its principal moments of inertia, in kg·m² about its own axes.
-    pub fn setInertia(self: *State, inertia: Vec3) void {
-        const arr = inertia.toArray();
-        var inv: [3]f32 = undefined;
-        for (&inv, arr) |*slot, moment| slot.* = if (self.inv_mass > 0 and moment > 0) 1 / moment else 0;
-        self.inv_inertia = Vec3.fromArray(inv);
-    }
+            /// Whether contacts and impulses move it: dynamic and awake.
+            pub fn pushable(self: State) bool {
+                return self.kind == .dynamic and !self.sleeping;
+            }
 
-    /// The angular velocity change a world-space angular impulse makes.
-    pub fn turnBy(self: State, angular_impulse: Vec3) Vec3 {
-        const local = self.pose.rotation.inverseRotateVector(angular_impulse);
-        return self.pose.rotation.rotateVector(local.mul(self.inv_inertia));
-    }
+            /// Whether it moves this step: awake and not static.
+            pub fn moving(self: State) bool {
+                return self.kind != .static and !self.sleeping;
+            }
 
-    /// The velocity of the point `offset` (world space) from its centre.
-    pub fn velocityAt(self: State, offset: Vec3) Vec3 {
-        return self.linear.add(self.angular.cross(offset));
-    }
+            pub fn setInertia(self: *State, inertia: S.Inertia) void {
+                self.inv_inertia = if (self.inv_mass > 0) S.invert(inertia) else S.angular_zero;
+            }
 
-    /// Applies `impulse` (N·s, world space) at `offset` from its centre.
-    pub fn applyImpulse(self: *State, impulse: Vec3, offset: Vec3) void {
-        self.linear = self.linear.add(impulse.scale(self.inv_mass));
-        self.angular = self.angular.add(self.turnBy(offset.cross(impulse)));
-    }
+            /// The angular velocity change a world-space angular impulse makes.
+            pub fn turnBy(self: State, angular_impulse: S.Angular) S.Angular {
+                return S.turnBy(self.pose.rotation, self.inv_inertia, angular_impulse);
+            }
 
-    pub fn wake(self: *State) void {
-        self.sleeping = false;
-        self.still_s = 0;
-    }
-};
+            /// The velocity of the point `offset` (world space) from its centre.
+            pub fn velocityAt(self: State, offset: Vec) Vec {
+                return self.linear.add(S.turnVelocity(self.angular, offset));
+            }
+
+            /// Applies `impulse` (N·s, world space) at `offset` from its centre.
+            pub fn applyImpulse(self: *State, impulse: Vec, offset: Vec) void {
+                self.linear = self.linear.add(impulse.scale(self.inv_mass));
+                self.angular = S.angularAdd(self.angular, self.turnBy(S.cross(offset, impulse)));
+            }
+
+            pub fn wake(self: *State) void {
+                self.sleeping = false;
+                self.still_s = 0;
+            }
+        };
+    };
+}
