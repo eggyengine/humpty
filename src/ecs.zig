@@ -70,6 +70,9 @@ pub const Collider = struct {
     friction: f32 = 0.5,
     /// Reports what it overlaps without pushing anything.
     sensor: bool = false,
+    /// The entity whose mesh `convex_hull_from_mesh` and `mesh` take, such as a child holding
+    /// the model, placed where it sits from this one; this entity's own when unset.
+    mesh_from: EntityRef = .{},
 
     /// Every shape before the entity's scale; along y where it has an axis.
     pub const Shape = union(enum) {
@@ -87,6 +90,19 @@ pub const Collider = struct {
         /// The entity's mesh itself, triangle by triangle: 3D static scenery only.
         mesh,
     };
+};
+
+/// Another entity, if set. Eggy's editor and scenes take it as an entity reference to any entity
+/// (`eggy_ref`, `Required`), so it can be dragged from the Hierarchy and is saved with the scene.
+pub const EntityRef = struct {
+    entity: ?clutch.EntityId = null,
+
+    pub const eggy_ref = .entity;
+    pub const Required = void;
+
+    pub fn init(entity: ?clutch.EntityId) EntityRef {
+        return .{ .entity = entity };
+    }
 };
 
 /// How fast its body moves, in m/s: set it to throw the body, read it to see.
@@ -264,7 +280,7 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
             const collider = (world.get(entity, Collider) orelse return).*;
             const transform = (world.get(entity, Host.Transform) orelse return).*;
             const place = Host.place(world, entity, transform);
-            var shape = shapeOf(collider.shape, place.scale, world, entity, gpa) catch return;
+            var shape = shapeOf(collider, place, world, entity, gpa) catch return;
             defer shape.deinit(gpa);
             const kind: ?BodyKind = if (world.get(entity, RigidBody)) |found| found.kind else null;
             const color = debug_draw.palette.of(kind, sleeping(world, entity), collider.sensor);
@@ -446,7 +462,7 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
                     return link;
                 };
             }
-            var shape = shapeOf(collider.shape, place.scale, world, entity, res.world.gpa) catch |err| {
+            var shape = shapeOf(collider, place, world, entity, res.world.gpa) catch |err| {
                 log.warn("cannot shape a collider ({t}): {t}", .{ collider.shape, err });
                 return link;
             };
@@ -481,9 +497,10 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
             }
         };
 
-        fn shapeOf(shape: Collider.Shape, scale: Vec3, world: *clutch.World, entity: clutch.EntityId, gpa: std.mem.Allocator) !Built {
-            if (analytic(shape, scale)) |exact| return .{ .shape = exact };
-            return fromMesh(shape, scale, world, entity, gpa);
+        /// `collider`'s shape on `entity`, which is at `place`.
+        fn shapeOf(collider: Collider, place: Place, world: *clutch.World, entity: clutch.EntityId, gpa: std.mem.Allocator) !Built {
+            if (analytic(collider.shape, place.scale)) |exact| return .{ .shape = exact };
+            return fromMesh(collider, place, world, entity, gpa);
         }
 
         /// Every shape but those made from a mesh, at the entity's scale.
@@ -501,19 +518,27 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
             };
         }
 
-        fn fromMesh(shape: Collider.Shape, scale: Vec3, world: *clutch.World, entity: clutch.EntityId, gpa: std.mem.Allocator) !Built {
+        /// The shape made from the mesh `collider` takes: `entity`'s own (at `place`), or that of
+        /// the entity its `mesh_from` names, moved from where that one sits into `entity`'s space.
+        fn fromMesh(collider: Collider, place: Place, world: *clutch.World, entity: clutch.EntityId, gpa: std.mem.Allocator) !Built {
             if (!@hasDecl(Host, "mesh")) return error.NoMeshSource;
-            const source = (try Host.mesh(world, entity, gpa)) orelse return error.NoMesh;
+            const shape = collider.shape;
+            const scale = place.scale;
+            const from = collider.mesh_from.entity orelse entity;
+            if (!world.isAlive(from)) return error.NoMesh;
+            const elsewhere: ?Place = if (std.meta.eql(from, entity)) null else Host.place(world, from, (world.get(from, Host.Transform) orelse return error.NoMesh).*);
+            const source = (try Host.mesh(world, from, gpa)) orelse return error.NoMesh;
             switch (source) {
                 // A built-in shape is used as itself, whichever way it was asked for.
-                .shape => |exact| return .{ .shape = analytic(exact, scale) orelse return error.NoMesh },
+                // ponytail: another entity's built-in shape takes its scale but not its offset or turn; make it a hull of its corners if that bites.
+                .shape => |exact| return .{ .shape = analytic(exact, if (elsewhere) |other| other.scale else scale) orelse return error.NoMesh },
                 .triangles => |triangles| {
                     defer gpa.free(triangles.positions);
                     defer gpa.free(triangles.indices);
                     if (triangles.positions.len == 0) return error.NoMesh;
                     const vertices = try gpa.alloc(S.Vec, triangles.positions.len);
                     errdefer gpa.free(vertices);
-                    for (vertices, triangles.positions) |*v, p| v.* = toVec(Vec3.fromArray(p).mul(scale));
+                    for (vertices, triangles.positions) |*v, p| v.* = toVec(if (elsewhere) |other| relativeCorner(place, other, Vec3.fromArray(p)) else Vec3.fromArray(p).mul(scale));
                     if (shape == .convex_hull_from_mesh) return .{ .shape = .{ .convex_hull = .{ .points = vertices } }, .vertices = vertices };
                     if (two) return error.NoMeshIn2D;
                     const indices = try gpa.alloc([S.n]u32, triangles.indices.len);
@@ -521,6 +546,13 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
                     return .{ .shape = .{ .mesh = .{ .vertices = vertices, .indices = indices } }, .vertices = vertices, .indices = indices };
                 },
             }
+        }
+
+        /// Corner `at` of a mesh on an entity at `other`, from `place` as `place`'s collider sees
+        /// its own scaled corners: turned into its frame, at the world's size.
+        fn relativeCorner(place: Place, other: Place, at: Vec3) Vec3 {
+            const in_world = other.position.add(other.rotation.rotateVector(at.mul(other.scale)));
+            return place.rotation.inverseRotateVector(in_world.sub(place.position));
         }
 
         fn dataOf(entity: clutch.EntityId) u64 {
@@ -693,4 +725,41 @@ test "drawColliders draws a scaled, moved box without a running world, only for 
     sink = .{};
     try P.drawColliders(&world, null, gpa, &sink);
     try std.testing.expect(sink.lines > 12);
+}
+
+/// `TestHost` with meshes: an entity with `HasCube` has a unit cube's corners.
+const MeshHost = struct {
+    const HasCube = struct {};
+    pub const Transform = TestHost.Transform;
+    pub const Time = TestHost.Time;
+    pub const deltaSeconds = TestHost.deltaSeconds;
+    pub const place = TestHost.place;
+    pub const setPlace = TestHost.setPlace;
+    pub fn mesh(world: *clutch.World, entity: clutch.EntityId, gpa: std.mem.Allocator) !?MeshSource {
+        if (world.get(entity, HasCube) == null) return null;
+        const positions = try gpa.alloc([3]f32, 8);
+        errdefer gpa.free(positions);
+        for (positions, 0..) |*corner, i| corner.* = .{ if (i & 1 != 0) 0.5 else -0.5, if (i & 2 != 0) 0.5 else -0.5, if (i & 4 != 0) 0.5 else -0.5 };
+        const indices = try gpa.dupe([3]u32, &.{ .{ 0, 1, 2 }, .{ 4, 5, 6 } });
+        return .{ .triangles = .{ .positions = positions, .indices = indices } };
+    }
+};
+
+test "a collider takes its mesh from the entity mesh_from names, where that entity sits" {
+    const P = Plugin(.three, f32, MeshHost);
+    const gpa = std.testing.allocator;
+    var world = clutch.World.init(gpa);
+    defer world.deinit();
+    try world.insertResource(TestHost.Time{ .delta_s = 1.0 / 60.0 });
+    try P.install(&world, gpa, .{});
+    defer world.runStage(.Deinit) catch {};
+
+    // The cube sits a metre above the collider's own entity, which has no mesh.
+    const cube = try world.spawn(.{ MeshHost.Transform{ .position = .init(0, 1, 0) }, MeshHost.HasCube{} });
+    _ = try world.spawn(.{ MeshHost.Transform{}, Collider{ .shape = .convex_hull_from_mesh, .mesh_from = .init(cube) } });
+    const ball = try world.spawn(.{ MeshHost.Transform{ .position = .init(0, 4, 0) }, Collider{ .shape = .{ .ball = .{} } }, RigidBody{} });
+    try runFrames(&world, 180);
+
+    // The cube's top is at 1.5, so the ball's centre rests half a metre above it.
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), world.get(ball, MeshHost.Transform).?.position.y, 0.05);
 }
