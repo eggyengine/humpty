@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .clutch = .{
-            .url = "git+https://git.tirbo.fish/eggy/clutch#2714412fa54af7558d55012f54453c9e75d2e359",
+            .url = "git+https://git.tirbo.fish/eggy/clutch#6ddafbde77be00628000913e7abc9cf3e516e989",
             .hash = "clutch-0.1.0-gpdHb6kfAgA7WgAGO251ESX_fPv9AiTHfi_Fyzd-IaYN",
         },
         .eggenvector = .{
