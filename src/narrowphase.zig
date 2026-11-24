@@ -1,6 +1,7 @@
 //! Narrowphase: the points where two placed shapes overlap, with the normal and depth that
 //! push them apart. Convex pairs go through GJK and EPA; resting contacts get several points,
 //! found from support points a little either side of the normal, so boxes and cylinders sit flat.
+//! A convex shape meets a mesh facet by facet, and a heightfield only in the cells beneath it.
 const std = @import("std");
 const shapes_zig = @import("shapes.zig");
 const gjk_zig = @import("gjk.zig");
@@ -88,9 +89,20 @@ pub fn Narrowphase(comptime S: type) type {
                     for (mesh.indices) |facet_indices| {
                         var facet: [S.n]Vec = undefined;
                         for (&facet, facet_indices) |*p, i| p.* = pose_b.transformPoint(mesh.vertices[i]);
-                        if (!bounds.overlaps(S.Aabb.around(&facet))) continue;
-                        convexConvex(&out, placed_a, Points{ .points = &facet }, a == .ball);
+                        convexFacet(&out, placed_a, bounds, facet);
                     }
+                },
+                .heightfield => |field| if (S.n == 3) {
+                    // Its cells under A's bounds, which are found in its own space.
+                    const cells = field.cellsUnder(a.aabb(pose_b.inverse().mul(pose_a))) orelse return out;
+                    const bounds = a.aabb(pose_a);
+                    for (cells.first[1]..cells.last[1] + 1) |row| for (cells.first[0]..cells.last[0] + 1) |column| {
+                        for (field.cellTriangles(@intCast(column), @intCast(row))) |triangle| {
+                            var facet: [S.n]Vec = undefined;
+                            for (&facet, triangle) |*p, local| p.* = pose_b.transformPoint(local);
+                            convexFacet(&out, placed_a, bounds, facet);
+                        }
+                    };
                 },
                 else => {
                     const placed_b: Placed = .{ .shape = b, .pose = pose_b };
@@ -108,6 +120,12 @@ pub fn Narrowphase(comptime S: type) type {
                 },
             }
             return out;
+        }
+
+        /// A convex shape whose world bounds are `bounds` against one facet in world space.
+        fn convexFacet(out: *Manifold, a: Placed, bounds: S.Aabb, facet: [S.n]Vec) void {
+            if (!bounds.overlaps(S.Aabb.around(&facet))) return;
+            convexConvex(out, a, Points{ .points = &facet }, a.shape == .ball);
         }
 
         fn ballBall(out: *Manifold, a: Shapes.Ball, pose_a: Pose, b: Shapes.Ball, pose_b: Pose) void {
@@ -241,4 +259,29 @@ test "a circle overlapping a 2D mesh segment is pushed off it" {
     const manifold = N.collide(.{ .ball = .{ .radius = 0.5 } }, S.Pose.fromTranslation(S.Vec.init(0, 0.4)), .{ .mesh = .{ .vertices = &vertices, .indices = &indices } }, S.Pose.identity());
     try std.testing.expectEqual(@as(usize, 1), manifold.len);
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), manifold.points[0].depth_m, 1e-4);
+}
+
+test "a heightfield tests only the cells under a shape, however big the grid" {
+    const S = space.Space(.three, f32);
+    const N = Narrowphase(S);
+    const Heightfield = shapes_zig.Shapes(S).Heightfield;
+    const capsule: shapes_zig.Shapes(S).Shape = .{ .capsule = .{ .half_height = 0.5, .radius = 0.3 } };
+    const at = S.Pose.fromTranslation(S.Vec.init(20.5, 0.7, 20.5));
+    var cells: [2]usize = undefined;
+    var depths: [2]f32 = undefined;
+    for ([_]u32{ 33, 1025 }, &cells, &depths) |side, *count, *depth| {
+        const heights = try std.testing.allocator.alloc(f32, side * side);
+        defer std.testing.allocator.free(heights);
+        @memset(heights, 0);
+        const field: Heightfield = .init(heights, side, 2, 2);
+        const under = field.cellsUnder(capsule.aabb(at)).?;
+        count.* = (under.last[0] - under.first[0] + 1) * (under.last[1] - under.first[1] + 1);
+        const manifold = N.collide(capsule, at, .{ .heightfield = field }, S.Pose.identity());
+        depth.* = manifold.points[0].depth_m;
+    }
+    // One cell either way of where it stands, in both grids, and the same contact.
+    try std.testing.expectEqual(@as(usize, 1), cells[0]);
+    try std.testing.expectEqual(cells[0], cells[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), depths[0], 1e-4);
+    try std.testing.expectApproxEqAbs(depths[0], depths[1], 1e-6);
 }

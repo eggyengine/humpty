@@ -1,6 +1,7 @@
 //! Collision shapes, after Rapier's and Avian's: a ball, cuboid, capsule, cylinder and cone, a
-//! convex hull of points, a mesh of triangles (segments in 2D) and a half-space, behind one
-//! tagged union. Every shape but the mesh and half-space is convex, found by its support point.
+//! convex hull of points, a mesh of triangles (segments in 2D), a heightfield and a half-space,
+//! behind one tagged union. Every shape but the mesh, heightfield and half-space is convex,
+//! found by its support point.
 const std = @import("std");
 
 /// The shapes of space `S` (a `space.Space`).
@@ -29,6 +30,78 @@ pub fn Shapes(comptime S: type) type {
         pub const Mesh = struct { vertices: []const Vec, indices: []const [S.n]u32 };
         /// Everything on the far side of the plane (line in 2D) through the origin facing `normal`.
         pub const HalfSpace = struct { normal: Vec };
+        /// 3D only: a grid of heights along y, `columns` along x by `rows` along z, `cell_x` and
+        /// `cell_z` metres apart, its first corner at the origin. Each cell is two triangles,
+        /// split from its first corner to the one across. For static scenery, like a mesh; the
+        /// world copies the heights when it is added. Make one with `init`, which finds its lowest
+        /// and highest points once.
+        pub const Heightfield = struct {
+            /// Row by row: the height at column `c`, row `r` is `heights[r * columns + c]`.
+            heights: []const T,
+            columns: u32,
+            rows: u32,
+            cell_x: T,
+            cell_z: T,
+            min_height: T,
+            max_height: T,
+
+            /// The grid of `heights`, `columns` wide; at least two columns and two rows.
+            pub fn init(heights: []const T, columns: u32, cell_x: T, cell_z: T) Heightfield {
+                var low = heights[0];
+                var high = heights[0];
+                for (heights[1..]) |h| {
+                    low = @min(low, h);
+                    high = @max(high, h);
+                }
+                return .{ .heights = heights, .columns = columns, .rows = @intCast(heights.len / columns), .cell_x = cell_x, .cell_z = cell_z, .min_height = low, .max_height = high };
+            }
+
+            /// The corner at `column`, `row`, in its own space.
+            pub fn corner(self: Heightfield, column: u32, row: u32) Vec {
+                if (two) unreachable;
+                return Vec.init(@as(T, @floatFromInt(column)) * self.cell_x, self.heights[row * self.columns + column], @as(T, @floatFromInt(row)) * self.cell_z);
+            }
+
+            /// The two triangles of the cell from `column`, `row`, counter-clockwise from above.
+            pub fn cellTriangles(self: Heightfield, column: u32, row: u32) [2][3]Vec {
+                const here = self.corner(column, row);
+                const right = self.corner(column + 1, row);
+                const below = self.corner(column, row + 1);
+                const across = self.corner(column + 1, row + 1);
+                return .{ .{ here, across, right }, .{ here, below, across } };
+            }
+
+            /// The cells `first` to `last` (inclusive), by column and row.
+            pub const Cells = struct { first: [2]u32, last: [2]u32 };
+
+            /// The cells whose triangles may reach into `bounds`, in its own space; null when
+            /// none can, beside the grid or above or below every height.
+            pub fn cellsUnder(self: Heightfield, bounds: Aabb) ?Cells {
+                if (two) unreachable;
+                if (bounds.min.y > self.max_height or bounds.max.y < self.min_height) return null;
+                const columns = cellRange(bounds.min.x, bounds.max.x, self.cell_x, self.columns - 1) orelse return null;
+                const rows = cellRange(bounds.min.z, bounds.max.z, self.cell_z, self.rows - 1) orelse return null;
+                return .{ .first = .{ columns[0], rows[0] }, .last = .{ columns[1], rows[1] } };
+            }
+
+            /// Its bounds in its own space.
+            pub fn localBounds(self: Heightfield) Aabb {
+                if (two) unreachable;
+                return .{
+                    .min = Vec.init(0, self.min_height, 0),
+                    .max = Vec.init(@as(T, @floatFromInt(self.columns - 1)) * self.cell_x, self.max_height, @as(T, @floatFromInt(self.rows - 1)) * self.cell_z),
+                };
+            }
+
+            /// The cells from `low` to `high` along an axis of `count` cells `cell` apart.
+            fn cellRange(low: T, high: T, cell: T, count: u32) ?[2]u32 {
+                const end = @as(T, @floatFromInt(count)) * cell;
+                if (high < 0 or low > end) return null;
+                const first: u32 = @intFromFloat(@max(@floor(low / cell), 0));
+                const last: u32 = @intFromFloat(@min(@floor(high / cell), @as(T, @floatFromInt(count - 1))));
+                return .{ @min(first, count - 1), last };
+            }
+        };
         /// One triangle (segment in 2D) of a mesh, in world space.
         pub const Facet = struct { points: [S.n]Vec };
 
@@ -40,22 +113,24 @@ pub fn Shapes(comptime S: type) type {
             cone: Cone,
             convex_hull: ConvexHull,
             mesh: Mesh,
+            heightfield: Heightfield,
             half_space: HalfSpace,
 
-            /// Whether this space has it: cylinders and cones are 3D only.
+            /// Whether this space has it: cylinders, cones and heightfields are 3D only.
             pub fn supported(self: Shape) bool {
                 return switch (self) {
                     .cylinder, .cone => !two,
+                    .heightfield => |field| !two and field.columns >= 2 and field.rows >= 2 and field.heights.len == @as(usize, field.columns) * field.rows,
                     .convex_hull => |hull| hull.points.len > 0,
                     .mesh => |mesh| mesh.indices.len > 0,
                     else => true,
                 };
             }
 
-            /// Whether `support` describes it: everything but a mesh or half-space.
+            /// Whether `support` describes it: everything but a mesh, heightfield or half-space.
             pub fn convex(self: Shape) bool {
                 return switch (self) {
-                    .mesh, .half_space => false,
+                    .mesh, .heightfield, .half_space => false,
                     else => true,
                 };
             }
@@ -69,7 +144,7 @@ pub fn Shapes(comptime S: type) type {
                     .cylinder => |cylinder| if (two) unreachable else axial(direction, cylinder.half_height).add(radial(direction).scale(cylinder.radius)),
                     .cone => |cone| if (two) unreachable else coneSupport(cone, direction),
                     .convex_hull => |hull| farthest(hull.points, direction),
-                    .mesh, .half_space => unreachable,
+                    .mesh, .heightfield, .half_space => unreachable,
                 };
             }
 
@@ -85,6 +160,22 @@ pub fn Shapes(comptime S: type) type {
                         }
                         return out;
                     },
+                    .heightfield => |field| {
+                        if (two) unreachable;
+                        // The corners of its box, placed.
+                        const local = field.localBounds();
+                        var out: ?Aabb = null;
+                        for (0..8) |i| {
+                            const p = pose.transformPoint(Vec.init(
+                                if (i & 1 != 0) local.max.x else local.min.x,
+                                if (i & 2 != 0) local.max.y else local.min.y,
+                                if (i & 4 != 0) local.max.z else local.min.z,
+                            ));
+                            const point: Aabb = .{ .min = p, .max = p };
+                            out = if (out) |so_far| so_far.merge(point) else point;
+                        }
+                        return out.?;
+                    },
                     else => {
                         // Along each world axis, its farthest point either way.
                         var min: [S.n]T = undefined;
@@ -99,7 +190,8 @@ pub fn Shapes(comptime S: type) type {
                 }
             }
 
-            /// Its volume in m³ (area in m² in 2D); zero for a mesh or half-space, which hold no mass.
+            /// Its volume in m³ (area in m² in 2D); zero for a mesh, heightfield or half-space,
+            /// which hold no mass.
             // ponytail: a convex hull counts as its bounding box; integrate over its faces when
             // hull-heavy bodies need exact mass.
             pub fn volume(self: Shape) T {
@@ -113,7 +205,7 @@ pub fn Shapes(comptime S: type) type {
                     .cylinder => |cylinder| 2 * std.math.pi * cylinder.radius * cylinder.radius * cylinder.half_height,
                     .cone => |cone| 2.0 / 3.0 * std.math.pi * cone.radius * cone.radius * cone.half_height,
                     .convex_hull => |hull| boxVolume(halfSize(hull.points)),
-                    .mesh, .half_space => 0,
+                    .mesh, .heightfield, .half_space => 0,
                 };
             }
 
@@ -131,7 +223,7 @@ pub fn Shapes(comptime S: type) type {
                     .cylinder => |cylinder| if (two) unreachable else cylinderInertia(cylinder.half_height, cylinder.radius, mass_kg),
                     .cone => |cone| if (two) unreachable else coneInertia(cone, mass_kg),
                     .convex_hull => |hull| boxInertia(halfSize(hull.points), mass_kg),
-                    .mesh, .half_space => S.angular_zero,
+                    .mesh, .heightfield, .half_space => S.angular_zero,
                 };
             }
         };

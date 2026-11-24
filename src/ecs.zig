@@ -89,7 +89,34 @@ pub const Collider = struct {
         convex_hull_from_mesh,
         /// The entity's mesh itself, triangle by triangle: 3D static scenery only.
         mesh,
+        /// The height grid of this name (`Host.heightfield`), its first corner at the entity:
+        /// 3D static scenery only.
+        heightfield: GridName,
     };
+};
+
+/// A height grid's name, which the host looks up. Eggy's editor and scenes keep it as text
+/// (`eggy_text`).
+pub const GridName = struct {
+    /// Zeroed past `len`, so two names compare equal by their bytes.
+    buffer: [max_len]u8 = @splat(0),
+    len: u8 = 0,
+
+    pub const max_len = 64;
+    pub const eggy_text = {};
+
+    /// `value`, cut to `max_len` bytes without splitting a UTF-8 character.
+    pub fn init(value: []const u8) GridName {
+        var end = @min(value.len, max_len);
+        while (end > 0 and end < value.len and (value[end] & 0xC0) == 0x80) end -= 1;
+        var name = GridName{ .len = @intCast(end) };
+        @memcpy(name.buffer[0..end], value[0..end]);
+        return name;
+    }
+
+    pub fn text(self: *const GridName) []const u8 {
+        return self.buffer[0..self.len];
+    }
 };
 
 /// Another entity, if set. Eggy's editor and scenes take it as an entity reference to any entity
@@ -166,7 +193,13 @@ pub const PhysicsStage = struct {
 ///     pub fn setPlace(world: *clutch.World, entity: clutch.EntityId, transform: *Transform, position: Vec3, rotation: emath.UnitQuat) void
 ///     // Optional, for `convex_hull_from_mesh` and `mesh`:
 ///     pub fn mesh(world: *clutch.World, entity: clutch.EntityId, gpa: Allocator) !?MeshSource
+///     // Optional, for `heightfield`: the grid named `name`, borrowed while the collider is built.
+///     pub fn heightfield(world: *clutch.World, name: []const u8) ?HeightfieldSource
 pub const Place = struct { position: Vec3, rotation: emath.UnitQuat, scale: Vec3 };
+
+/// A height grid, before the entity's scale: `heights` row by row, `columns` along x, rows along
+/// z, `cell_m` apart both ways.
+pub const HeightfieldSource = struct { heights: []const f32, columns: u32, cell_m: f32 };
 
 /// An entity's mesh: a shape the host knows exactly (a built-in cube), or triangles, both
 /// before the entity's scale. Triangles are allocated with the `gpa` given, which physics frees.
@@ -466,15 +499,16 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
                 log.warn("cannot shape a collider ({t}): {t}", .{ collider.shape, err });
                 return link;
             };
-            defer shape.deinit(res.world.gpa);
             const offset = offsetPose(collider, place.scale);
-            link.collider = res.world.addCollider(.{
+            // The shape's memory is the world's from here, without another copy.
+            link.collider = res.world.addColliderOwned(.{
                 .shape = shape.shape,
                 // With no body, a collider's own pose is where it sits in the world.
                 .local_pose = if (link.body == null) pose.mul(offset) else offset,
                 .material = .{ .restitution = collider.restitution, .friction = collider.friction },
                 .sensor = collider.sensor,
             }, link.body, data) catch |err| {
+                shape.deinit(res.world.gpa);
                 log.warn("cannot add a collider ({t}): {t}", .{ collider.shape, err });
                 return link;
             };
@@ -485,22 +519,41 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
             return World.Pose.fromTranslation(toVec(collider.offset_m.mul(scale)));
         }
 
-        /// A built shape, and the vertices it borrows from mesh data, freed once the world has copied them.
+        /// A built shape, and the memory its points, vertices or heights are in, which the world
+        /// takes (`addColliderOwned`) or `deinit` frees.
         const Built = struct {
             shape: World.Shape,
             vertices: []S.Vec = &.{},
             indices: [][S.n]u32 = &.{},
+            heights: []T = &.{},
 
             fn deinit(self: *Built, gpa: std.mem.Allocator) void {
                 gpa.free(self.vertices);
                 gpa.free(self.indices);
+                gpa.free(self.heights);
             }
         };
 
         /// `collider`'s shape on `entity`, which is at `place`.
         fn shapeOf(collider: Collider, place: Place, world: *clutch.World, entity: clutch.EntityId, gpa: std.mem.Allocator) !Built {
             if (analytic(collider.shape, place.scale)) |exact| return .{ .shape = exact };
-            return fromMesh(collider, place, world, entity, gpa);
+            return switch (collider.shape) {
+                .heightfield => |*name| fromHeightfield(name.text(), place.scale, world, gpa),
+                else => fromMesh(collider, place, world, entity, gpa),
+            };
+        }
+
+        /// The grid named `name`, at the entity's `scale`.
+        fn fromHeightfield(name: []const u8, scale: Vec3, world: *clutch.World, gpa: std.mem.Allocator) !Built {
+            if (!@hasDecl(Host, "heightfield")) return error.NoHeightfieldSource;
+            if (two) return error.NoHeightfieldIn2D;
+            const grid = Host.heightfield(world, name) orelse return error.NoHeightfield;
+            if (grid.columns < 2 or grid.heights.len < 2 * @as(usize, grid.columns) or grid.heights.len % grid.columns != 0) return error.NoHeightfield;
+            const heights = try gpa.alloc(T, grid.heights.len);
+            for (heights, grid.heights) |*out, h| out.* = h * scale.y;
+            const cell_x: T = grid.cell_m * @abs(scale.x);
+            const cell_z: T = grid.cell_m * @abs(scale.z);
+            return .{ .shape = .{ .heightfield = .init(heights, grid.columns, cell_x, cell_z) }, .heights = heights };
         }
 
         /// Every shape but those made from a mesh, at the entity's scale.
@@ -514,7 +567,7 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
                 .cylinder => |cylinder| .{ .cylinder = .{ .half_height = cylinder.half_height_m * scale.y, .radius = cylinder.radius_m * across } },
                 .cone => |cone| .{ .cone = .{ .half_height = cone.half_height_m * scale.y, .radius = cone.radius_m * across } },
                 .half_space => |half_space| .{ .half_space = .{ .normal = toVec(half_space.normal).normalize() } },
-                .convex_hull_from_mesh, .mesh => null,
+                .convex_hull_from_mesh, .mesh, .heightfield => null,
             };
         }
 

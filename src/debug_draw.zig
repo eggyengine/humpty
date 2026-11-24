@@ -1,7 +1,7 @@
 //! Wireframes of shapes, as line segments handed to a sink the caller owns, so any renderer can
 //! draw them. Balls and boxes are drawn exactly; other convex shapes by their outline in each
-//! axis plane (found through `support`), meshes edge by edge, and a half-space as a patch of
-//! its surface with its normal.
+//! axis plane (found through `support`), meshes and heightfields edge by edge, and a half-space
+//! as a patch of its surface with its normal.
 const std = @import("std");
 const shapes_zig = @import("shapes.zig");
 const BodyKind = @import("body.zig").BodyKind;
@@ -63,6 +63,11 @@ pub fn DebugDraw(comptime S: type) type {
                         try sink.line(points[0], points[1], color);
                         try sink.line(points[1], points[2], color);
                         try sink.line(points[2], points[0], color);
+                    }
+                },
+                .heightfield => |field| if (two) unreachable else for (0..field.rows - 1) |row| for (0..field.columns - 1) |column| {
+                    for (field.cellTriangles(@intCast(column), @intCast(row))) |triangle| {
+                        for (triangle, 0..) |corner, i| try sink.line(pose.transformPoint(corner), pose.transformPoint(triangle[(i + 1) % 3]), color);
                     }
                 },
                 .half_space => |half_space| try drawPlane(half_space.normal, pose, color, sink),

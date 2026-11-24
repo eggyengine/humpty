@@ -20,6 +20,7 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
         pub const Vec = S.Vec;
         pub const Pose = S.Pose;
         pub const Shape = shapes_zig.Shapes(S).Shape;
+        pub const Heightfield = shapes_zig.Shapes(S).Heightfield;
         pub const Body = b.Bodies(S).Body;
         pub const Collider = c.Colliders(S).Collider;
         pub const Material = c.Colliders(S).Material;
@@ -158,15 +159,23 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
         }
 
         /// Attaches `collider` to `parent`, or with no parent makes it static scenery. A hull's
-        /// points and a mesh's vertices are copied. The parent's mass is spread over its colliders
-        /// by volume, for how it turns.
+        /// points, a mesh's vertices and indices and a heightfield's heights are copied. The
+        /// parent's mass is spread over its colliders by volume, for how it turns.
         pub fn addCollider(self: *Self, collider: Collider, parent: ?b.BodyHandle, user_data: u64) !c.ColliderHandle {
             if (!collider.shape.supported()) return error.UnsupportedShape;
-            if (parent) |body| if (self.bodies.get(body) == null) return error.StaleBody;
             var owned = collider;
             owned.shape = try self.copyShape(collider.shape);
             errdefer self.freeShape(owned.shape);
-            const handle = try self.colliders.add(self.gpa, .{ .item = owned, .user_data = user_data, .parent = parent });
+            return self.addColliderOwned(owned, parent, user_data);
+        }
+
+        /// `addCollider` without the copy: the world takes the shape's points, vertices and
+        /// indices or heights, which must come from its allocator, and frees them when the
+        /// collider goes. On an error they are still the caller's.
+        pub fn addColliderOwned(self: *Self, collider: Collider, parent: ?b.BodyHandle, user_data: u64) !c.ColliderHandle {
+            if (!collider.shape.supported()) return error.UnsupportedShape;
+            if (parent) |body| if (self.bodies.get(body) == null) return error.StaleBody;
+            const handle = try self.colliders.add(self.gpa, .{ .item = collider, .user_data = user_data, .parent = parent });
             if (parent) |body| self.updateInertia(body);
             return handle;
         }
@@ -187,6 +196,11 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
                     errdefer self.gpa.free(vertices);
                     break :blk .{ .mesh = .{ .vertices = vertices, .indices = try self.gpa.dupe([S.n]u32, mesh.indices) } };
                 },
+                .heightfield => |field| blk: {
+                    var copied = field;
+                    copied.heights = try self.gpa.dupe(T, field.heights);
+                    break :blk .{ .heightfield = copied };
+                },
                 else => shape,
             };
         }
@@ -198,6 +212,7 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
                     self.gpa.free(mesh.vertices);
                     self.gpa.free(mesh.indices);
                 },
+                .heightfield => |field| self.gpa.free(field.heights),
                 else => {},
             }
         }

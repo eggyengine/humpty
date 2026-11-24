@@ -1,5 +1,6 @@
 //! Rays: where a line from a point first meets a shape. Balls, cuboids, half-spaces and mesh
-//! facets are solved exactly; other convex shapes are stepped towards by their GJK distance.
+//! facets are solved exactly, heightfields cell by cell along the ray; other convex shapes are
+//! stepped towards by their GJK distance.
 const std = @import("std");
 const c = @import("collider.zig");
 const shapes_zig = @import("shapes.zig");
@@ -37,6 +38,7 @@ pub fn Rays(comptime S: type) type {
                 .cuboid => |cuboid| castCuboid(ray, cuboid, pose),
                 .half_space => |half_space| castPlane(ray, Shapes.placedPlane(half_space, pose)),
                 .mesh => |mesh| castMesh(ray, mesh, pose),
+                .heightfield => |field| if (S.n == 3) castHeightfield(ray, field, pose) else unreachable,
                 else => castConvex(ray, shape, pose),
             } orelse return null;
             if (hit.distance_m > ray.max_distance_m) return null;
@@ -101,6 +103,72 @@ pub fn Rays(comptime S: type) type {
                 if (nearest == null or hit.distance_m < nearest.?.distance_m) nearest = hit;
             }
             return nearest;
+        }
+
+        /// The cells the ray crosses, in its own space, nearest first (a 2D DDA over the grid),
+        /// each cell's two triangles tried until one is hit.
+        fn castHeightfield(ray: Ray, field: Shapes.Heightfield, pose: Pose) ?Hit {
+            const local: Ray = .{ .origin = pose.inverseTransformPoint(ray.origin), .direction = pose.inverseTransformVector(ray.direction), .max_distance_m = ray.max_distance_m };
+            const span = enterAndLeave(local, field.localBounds()) orelse return null;
+            const o = local.origin.toArray();
+            const d = local.direction.toArray();
+            const cell = [2]T{ field.cell_x, field.cell_z };
+            const last = [2]u32{ field.columns - 2, field.rows - 2 };
+            // Per axis (x, then z): the cell, which way it steps, the distance to its next edge
+            // and between edges.
+            var at: [2]u32 = undefined;
+            var step: [2]i2 = undefined;
+            var next: [2]T = undefined;
+            var delta: [2]T = undefined;
+            for (0..2, [_]usize{ 0, 2 }) |axis, i| {
+                const start = o[i] + d[i] * span[0];
+                at[axis] = @intFromFloat(std.math.clamp(@floor(start / cell[axis]), 0, @as(T, @floatFromInt(last[axis]))));
+                step[axis] = if (d[i] > 0) 1 else if (d[i] < 0) -1 else 0;
+                if (step[axis] == 0) {
+                    next[axis] = std.math.inf(T);
+                    delta[axis] = std.math.inf(T);
+                    continue;
+                }
+                const edge = @as(T, @floatFromInt(at[axis] + @intFromBool(step[axis] > 0))) * cell[axis];
+                next[axis] = (edge - o[i]) / d[i];
+                delta[axis] = cell[axis] / @abs(d[i]);
+            }
+            while (true) {
+                var nearest: ?Hit = null;
+                for (field.cellTriangles(at[0], at[1])) |triangle| {
+                    const hit = castFacet(local, triangle) orelse continue;
+                    if (nearest == null or hit.distance_m < nearest.?.distance_m) nearest = hit;
+                }
+                if (nearest) |hit| return .{ .distance_m = hit.distance_m, .normal = pose.transformVector(hit.normal) };
+                // On to the neighbour whose edge comes first, until the ray leaves the grid.
+                const axis: usize = if (next[0] < next[1]) 0 else 1;
+                if (next[axis] > span[1]) return null;
+                if (step[axis] > 0 and at[axis] == last[axis]) return null;
+                if (step[axis] < 0 and at[axis] == 0) return null;
+                at[axis] = if (step[axis] > 0) at[axis] + 1 else at[axis] - 1;
+                next[axis] += delta[axis];
+            }
+        }
+
+        /// How far along `ray` it enters `box` and leaves it, within its length; null when it misses.
+        fn enterAndLeave(ray: Ray, box: S.Aabb) ?[2]T {
+            const o = ray.origin.toArray();
+            const d = ray.direction.toArray();
+            const low = box.min.toArray();
+            const high = box.max.toArray();
+            var enter: T = 0;
+            var leave: T = ray.max_distance_m;
+            for (0..S.n) |i| {
+                if (@abs(d[i]) < 1e-12) {
+                    if (o[i] < low[i] or o[i] > high[i]) return null;
+                    continue;
+                }
+                const t1 = (low[i] - o[i]) / d[i];
+                const t2 = (high[i] - o[i]) / d[i];
+                enter = @max(enter, @min(t1, t2));
+                leave = @min(leave, @max(t1, t2));
+            }
+            return if (enter <= leave) .{ enter, leave } else null;
         }
 
         fn castFacet(ray: Ray, p: [S.n]Vec) ?Hit {

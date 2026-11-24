@@ -148,6 +148,49 @@ test "a capsule, cylinder, cone and hull each come to rest on the ground" {
     }
 }
 
+test "a capsule rests on a heightfield where it rests on the same triangles as a mesh, and rays agree" {
+    const World = Physics3;
+    const Vec = World.Vec;
+    const gpa = std.testing.allocator;
+    // 33 by 33 corners two metres apart: rolling ground.
+    const side = 33;
+    var heights: [side * side]f32 = undefined;
+    for (0..side) |row| for (0..side) |column| {
+        const x: f32 = @floatFromInt(column * 2);
+        const z: f32 = @floatFromInt(row * 2);
+        heights[row * side + column] = 2 * @sin(x * 0.3) + 1.5 * @cos(z * 0.2);
+    };
+    const field: World.Heightfield = .init(&heights, side, 2, 2);
+    // The same ground as a mesh: each cell's two triangles.
+    var vertices: [(side - 1) * (side - 1) * 6]Vec = undefined;
+    var indices: [(side - 1) * (side - 1) * 2][3]u32 = undefined;
+    for (0..side - 1) |row| for (0..side - 1) |column| {
+        const cell = row * (side - 1) + column;
+        for (field.cellTriangles(@intCast(column), @intCast(row)), 0..) |triangle, t| {
+            const first: u32 = @intCast(cell * 6 + t * 3);
+            for (triangle, 0..) |corner, i| vertices[first + i] = corner;
+            indices[cell * 2 + t] = .{ first, first + 1, first + 2 };
+        }
+    };
+
+    var rest: [2]f32 = undefined;
+    var down: [2]f32 = undefined;
+    const ground = [_]World.Shape{ .{ .heightfield = field }, .{ .mesh = .{ .vertices = &vertices, .indices = &indices } } };
+    for (ground, &rest, &down) |shape, *y, *distance| {
+        var world = try World.init(gpa, .{ .gravity = Vec.init(0, -9.81, 0), .fixed_step_s = 1.0 / 60.0 });
+        defer world.deinit();
+        _ = try world.addCollider(.{ .shape = shape }, null, 0);
+        const capsule = try world.addBody(.{ .kind = .dynamic, .pose = World.Pose.fromTranslation(Vec.init(31.3, 6, 30.7)), .mass_kg = 80, .rotation = .locked }, 1);
+        _ = try world.addCollider(.{ .shape = .{ .capsule = .{ .half_height = 0.5, .radius = 0.3 } } }, capsule, 1);
+        for (0..240) |_| try world.update(1.0 / 60.0);
+        y.* = world.pose(capsule).translation.y;
+        world.removeBody(capsule);
+        distance.* = (world.raycast(.{ .origin = Vec.init(13.7, 20, 41.1), .direction = Vec.init(0.1, -1, 0.05).normalize(), .max_distance_m = 100 }, .{}) orelse return error.TestExpectedHit).distance_m;
+    }
+    try std.testing.expectApproxEqAbs(rest[1], rest[0], 1e-3);
+    try std.testing.expectApproxEqAbs(down[1], down[0], 1e-4);
+}
+
 test {
     std.testing.refAllDecls(@This());
     _ = @import("slots.zig");
