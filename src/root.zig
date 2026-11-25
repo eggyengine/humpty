@@ -15,6 +15,8 @@ pub const BodyHandle = @import("body.zig").BodyHandle;
 pub const BodyKind = @import("body.zig").BodyKind;
 pub const Rotation = @import("body.zig").Rotation;
 pub const ColliderHandle = @import("collider.zig").ColliderHandle;
+pub const JointHandle = @import("joint.zig").JointHandle;
+pub const VehicleHandle = @import("vehicle.zig").VehicleHandle;
 pub const shapes = @import("shapes.zig");
 pub const ecs = @import("ecs.zig");
 pub const debug_draw = @import("debug_draw.zig");
@@ -200,4 +202,77 @@ test {
     _ = @import("ray.zig");
     _ = @import("shapes.zig");
     _ = @import("space.zig");
+    _ = @import("shapecast.zig");
+    _ = @import("joint.zig");
+    _ = @import("vehicle.zig");
+}
+
+test "a body's mass and centre come from its colliders, and one added later rides along and adds its own" {
+    const World = Physics3;
+    const Vec = World.Vec;
+    var world = try World.init(std.testing.allocator, .{ .gravity = Vec.init(0, -9.81, 0), .fixed_step_s = 1.0 / 60.0 });
+    defer world.deinit();
+    _ = try world.addCollider(.{ .shape = .{ .half_space = .{ .normal = Vec.init(0, 1, 0) } } }, null, 0);
+
+    // A 1000 kg deck two metres long.
+    const deck = try world.addBody(.{ .kind = .dynamic, .pose = World.Pose.fromTranslation(Vec.init(0, 0.25, 0)), .mass_kg = 1000 }, 1);
+    _ = try world.addCollider(.{ .shape = .{ .cuboid = .{ .half_extents = Vec.init(1, 0.25, 1) } } }, deck, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 1000), world.massOf(deck).mass_kg, 1e-3);
+    try std.testing.expect(world.massOf(deck).center.approxEql(Vec.init(0, 0.25, 0), 1e-6));
+
+    // A 500 kg machine built on its end: three halves the mass, its centre a third of the way out.
+    for (0..30) |_| try world.update(1.0 / 60.0);
+    const machine = try world.addCollider(.{ .shape = .{ .cuboid = .{ .half_extents = Vec.splat(0.25) } }, .local_pose = World.Pose.fromTranslation(Vec.init(0.75, 0.5, 0)), .mass_kg = 500 }, deck, 2);
+    try std.testing.expectApproxEqAbs(@as(f32, 1500), world.massOf(deck).mass_kg, 1e-3);
+    const centre = world.massOf(deck).center;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), centre.x, 1e-4);
+
+    // Pushed along, the machine goes with the deck, and the deck stays flat on the ground.
+    world.applyImpulse(deck, Vec.init(6000, 0, 0), .center_of_mass);
+    for (0..120) |_| try world.update(1.0 / 60.0);
+    const machine_at = world.pose(deck).transformPoint(Vec.init(0.75, 0.5, 0));
+    const hit = world.raycast(.{ .origin = machine_at.add(Vec.init(0, 5, 0)), .direction = Vec.init(0, -1, 0), .max_distance_m = 10 }, .{}).?;
+    try std.testing.expectEqual(machine, hit.collider);
+    try std.testing.expect(world.pose(deck).translation.x > 0.3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), world.pose(deck).translation.y, 0.02);
+
+    // With its centre set low, the same body balances there instead.
+    world.setProperties(deck, .{ .kind = .dynamic, .mass_kg = 1000, .center_of_mass_m = Vec.init(0, -0.2, 0) });
+    try std.testing.expect(world.pose(deck).transformPoint(Vec.init(0, -0.2, 0)).approxEql(world.massOf(deck).center, 1e-5));
+    // Static, it keeps its place; dynamic again, it falls from there.
+    const parked = world.pose(deck);
+    world.setProperties(deck, .{ .kind = .static });
+    for (0..60) |_| try world.update(1.0 / 60.0);
+    try std.testing.expect(world.pose(deck).translation.approxEql(parked.translation, 1e-6));
+}
+
+test "a ball at 30 m/s doesn't pass through a heightfield, and a crate rides a moving platform" {
+    const World = Physics3;
+    const Vec = World.Vec;
+    var world = try World.init(std.testing.allocator, .{ .gravity = Vec.init(0, -9.81, 0), .fixed_step_s = 1.0 / 120.0 });
+    defer world.deinit();
+    const flat: [30 * 30]f32 = @splat(0);
+    _ = try world.addCollider(.{ .shape = .{ .heightfield = .init(&flat, 30, 1, 1) } }, null, 0);
+    const ball = try world.addBody(.{ .kind = .dynamic, .pose = World.Pose.fromTranslation(Vec.init(3, 3, 15)), .mass_kg = 5, .linear_velocity = Vec.init(20, -22.4, 0) }, 1);
+    _ = try world.addCollider(.{ .shape = .{ .ball = .{ .radius = 0.4 } } }, ball, 1);
+
+    // A platform gliding at 3 m/s with a crate on it, far from the ball.
+    const platform = try world.addBody(.{ .kind = .kinematic, .pose = World.Pose.fromTranslation(Vec.init(100, 0, 0)), .linear_velocity = Vec.init(3, 0, 0) }, 2);
+    _ = try world.addCollider(.{ .shape = .{ .cuboid = .{ .half_extents = Vec.init(4, 0.25, 4) } } }, platform, 2);
+    const crate = try world.addBody(.{ .kind = .dynamic, .pose = World.Pose.fromTranslation(Vec.init(100, 0.75, 0)), .mass_kg = 20 }, 3);
+    _ = try world.addCollider(.{ .shape = .{ .cuboid = .{ .half_extents = Vec.splat(0.5) } }, .material = .{ .friction = 0.8 } }, crate, 3);
+
+    for (0..240) |_| {
+        try world.update(1.0 / 120.0);
+        try std.testing.expect(world.pose(ball).translation.y > 0.2);
+    }
+    // The platform set off at once, so the crate slid until friction caught it up; since, it
+    // has ridden along without slipping, and knows how fast its ground goes.
+    const behind = world.pose(platform).translation.x - world.pose(crate).translation.x;
+    for (0..120) |_| try world.update(1.0 / 120.0);
+    try std.testing.expectApproxEqAbs(behind, world.pose(platform).translation.x - world.pose(crate).translation.x, 0.02);
+    try std.testing.expect(@abs(behind) < 2);
+    const ground = world.groundOf(crate, Vec.init(0, 1, 0), 0.5).?;
+    try std.testing.expectEqual(@as(?BodyHandle, platform), ground.body);
+    try std.testing.expect(ground.velocity.approxEql(Vec.init(3, 0, 0), 1e-4));
 }

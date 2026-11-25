@@ -35,6 +35,8 @@ pub fn Solver(comptime S: type) type {
             friction: T,
             normal_impulse: T = 0,
             tangent_impulse: [S.n - 1]T = @splat(0),
+            /// Which of the world's contacts it holds apart.
+            contact: u32 = 0,
 
             /// A contact at `point` between `a` and `b` (either null for scenery).
             pub fn init(a: ?*State, b: ?*State, point: Vec, normal: Vec, depth_m: T, friction: T, restitution: T, dt_s: T) Constraint {
@@ -44,8 +46,8 @@ pub fn Solver(comptime S: type) type {
                     .b = if (b) |s| if (s.pushable()) s else null else null,
                     .moving_a = if (a) |s| if (s.moving()) s else null else null,
                     .moving_b = if (b) |s| if (s.moving()) s else null else null,
-                    .offset_a = if (a) |s| point.sub(s.pose.translation) else Vec.zero,
-                    .offset_b = if (b) |s| point.sub(s.pose.translation) else Vec.zero,
+                    .offset_a = if (a) |s| point.sub(s.center()) else Vec.zero,
+                    .offset_b = if (b) |s| point.sub(s.center()) else Vec.zero,
                     .normal = normal,
                     .tangents = tangents,
                     .normal_mass = 0,
@@ -84,7 +86,7 @@ pub fn Solver(comptime S: type) type {
                 if (self.b) |s| s.applyImpulse(impulse, self.offset_b);
             }
 
-            fn solveOnce(self: *Constraint) void {
+            pub fn solveOnce(self: *Constraint) void {
                 // Friction first, limited by the normal impulse so far, so the push has the last word.
                 for (self.tangents, self.tangent_mass, &self.tangent_impulse) |tangent, mass, *total| {
                     const limit = self.friction * self.normal_impulse;

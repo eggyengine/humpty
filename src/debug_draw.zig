@@ -17,6 +17,13 @@ pub const palette = struct {
     pub const sleeping: Color = .{ 0.35, 0.55, 0.95, 1 };
     pub const sensor: Color = .{ 1, 0.8, 0.25, 1 };
     pub const contact: Color = .{ 1, 0.3, 0.25, 1 };
+    /// How hard a contact or wheel pushes.
+    pub const force: Color = .{ 1, 0.55, 0.2, 1 };
+    pub const center: Color = .{ 1, 1, 1, 1 };
+    pub const joint: Color = .{ 0.3, 0.85, 0.95, 1 };
+    /// Where a joint or suspension stops, and a wheel's cast.
+    pub const limit: Color = .{ 0.95, 0.35, 0.75, 1 };
+    pub const suspension: Color = .{ 0.95, 0.9, 0.3, 1 };
 
     /// A collider's colour: a sensor's whatever it is on, else by its body's kind and whether it
     /// sleeps (`null` body: static scenery).
@@ -97,7 +104,7 @@ pub fn DebugDraw(comptime S: type) type {
         }
 
         /// A circle of `radius` in the plane of local axes `u` and `v`.
-        fn ring(pose: Pose, u: usize, v: usize, radius: T, color: Color, sink: anytype) !void {
+        pub fn ring(pose: Pose, u: usize, v: usize, radius: T, color: Color, sink: anytype) !void {
             var last = pose.transformPoint(S.axis(u).scale(radius));
             for (1..segments + 1) |i| {
                 const angle = @as(T, @floatFromInt(i)) / segments * std.math.tau;

@@ -15,6 +15,11 @@ pub fn Colliders(comptime S: type) type {
             material: Material = .{},
             /// A sensor reports what it overlaps but pushes nothing.
             sensor: bool = false,
+            /// Its own mass, added to its body's at its place; null takes a share of the body's
+            /// own mass by volume.
+            mass_kg: ?S.Real = null,
+            /// Off, it touches nothing, adds no mass and queries pass through it.
+            enabled: bool = true,
         };
 
         pub const Material = struct {
