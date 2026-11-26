@@ -1,0 +1,21 @@
+src/ecs_vehicles.zig
+  s_998bfe1ed6a70f::t_7b6e8476e67305 35-49,62-64,72-79,175,229,232,236-242,249-256,294-304
+src/vehicle.zig
+  s_998bfe1ed6a70f::t_988cd1b44216d8 25,45-68,154-172,217,240,345-430,555-615
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "1e2cc9e6f907649b7f0fe3a8f9cf5d42bf19bb29",
+  "prompts": {},
+  "sessions": {
+    "s_998bfe1ed6a70f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7500c0d0-b23c-423e-8069-894aa8b948d1",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Thribhu K <me@tirbo.fish>"
+    }
+  }
+}
