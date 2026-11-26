@@ -101,7 +101,119 @@ pub fn Casts(comptime S: type) type {
 
         fn againstFacet(moving: Moved, direction: Vec, max_m: T, swept: S.Aabb, facet: Facet) ?Hit {
             if (!swept.overlaps(S.Aabb.around(&facet.points))) return null;
+            // A ball (a wheel, most often) needs no advancing: where it meets is worked out.
+            if (S.n == 3 and moving.shape == .ball) switch (ballFacet(moving.pose.translation.add(moving.offset), moving.shape.ball.radius, direction, max_m, facet.points)) {
+                .met => |hit| return hit,
+                .degenerate => {},
+            };
             return advance(moving, direction, max_m, facet);
+        }
+
+        /// Where a ball at `centre` cast along unit `direction` first meets a triangle: its face,
+        /// an edge (a capsule round it) or a corner (a ball round it), found exactly, and
+        /// reported as `advance` would. A triangle without area is `.degenerate`, for `advance`.
+        fn ballFacet(centre: Vec, radius: T, direction: Vec, max_m: T, points: [3]Vec) union(enum) { degenerate, met: ?Hit } {
+            const a, const b, const c = points;
+            const across = b.sub(a).cross(c.sub(a));
+            const area = across.length();
+            if (!(area > 1e-12)) return .degenerate;
+            const normal = across.scale(1 / area);
+
+            // Touching already: met where it starts.
+            const start_nearest = nearestOnTriangle(centre, a, b, c);
+            const start_gap = start_nearest.sub(centre).length() - radius;
+            if (start_gap < touching_m) return .{ .met = .{ .distance_m = 0, .point = if (start_gap > 0) start_nearest else centre, .normal = direction.negate() } };
+
+            var first: ?T = null;
+            // The face, met from the side the ball is on.
+            const side = normal.dot(centre.sub(a));
+            const facing = if (side < 0) normal.negate() else normal;
+            const approach = -facing.dot(direction);
+            if (@abs(side) >= radius and approach > 1e-9) {
+                const t = (@abs(side) - radius) / approach;
+                if (inTriangle(centre.add(direction.scale(t)).sub(facing.scale(radius)), a, b, c, normal)) first = t;
+            }
+            for ([_][2]Vec{ .{ a, b }, .{ b, c }, .{ c, a } }) |edge| first = earlier(first, edgeTime(centre, direction, edge[0], edge[1], radius));
+            for (points) |corner| first = earlier(first, cornerTime(centre, direction, corner, radius));
+
+            const t = first orelse return .{ .met = null };
+            if (t > max_m) return .{ .met = null };
+            const at = centre.add(direction.scale(t));
+            const point = nearestOnTriangle(at, a, b, c);
+            const away = at.sub(point);
+            const apart = away.length();
+            return .{ .met = .{ .distance_m = t, .point = point, .normal = if (apart > 1e-9) away.scale(1 / apart) else facing } };
+        }
+
+        fn earlier(kept: ?T, next: ?T) ?T {
+            const found = next orelse return kept;
+            return if (kept) |so_far| @min(so_far, found) else found;
+        }
+
+        /// Whether `p`, on the plane of triangle `a`, `b`, `c` (unit `normal`), is inside it.
+        fn inTriangle(p: Vec, a: Vec, b: Vec, c: Vec, normal: Vec) bool {
+            const slack: T = -1e-6;
+            return b.sub(a).cross(p.sub(a)).dot(normal) >= slack and
+                c.sub(b).cross(p.sub(b)).dot(normal) >= slack and
+                a.sub(c).cross(p.sub(c)).dot(normal) >= slack;
+        }
+
+        /// How far along unit `direction` a ball at `centre` meets the capsule of `radius` round
+        /// the edge from `from` to `to`, along its side; its ends are the corners'.
+        fn edgeTime(centre: Vec, direction: Vec, from: Vec, to: Vec, radius: T) ?T {
+            const edge = to.sub(from);
+            const m = centre.sub(from);
+            const ee = edge.dot(edge);
+            const ed = edge.dot(direction);
+            const em = edge.dot(m);
+            const qa = ee - ed * ed;
+            // Along the edge: it meets a corner first.
+            if (!(qa > 1e-9 * ee)) return null;
+            const qb = ee * m.dot(direction) - em * ed;
+            const qc = ee * (m.dot(m) - radius * radius) - em * em;
+            const discriminant = qb * qb - qa * qc;
+            if (discriminant < 0) return null;
+            const t = (-qb - @sqrt(discriminant)) / qa;
+            if (t < 0) return null;
+            const along = (em + t * ed) / ee;
+            return if (along >= 0 and along <= 1) t else null;
+        }
+
+        /// How far along unit `direction` a ball at `centre` meets one of `radius` at `corner`.
+        fn cornerTime(centre: Vec, direction: Vec, corner: Vec, radius: T) ?T {
+            const m = centre.sub(corner);
+            const closing = m.dot(direction);
+            if (closing > 0) return null;
+            const discriminant = closing * closing - (m.dot(m) - radius * radius);
+            if (discriminant < 0) return null;
+            const t = -closing - @sqrt(discriminant);
+            return if (t >= 0) t else null;
+        }
+
+        /// The point of triangle `a`, `b`, `c` nearest `p` (Ericson, Real-Time Collision Detection).
+        fn nearestOnTriangle(p: Vec, a: Vec, b: Vec, c: Vec) Vec {
+            const ab = b.sub(a);
+            const ac = c.sub(a);
+            const ap = p.sub(a);
+            const d1 = ab.dot(ap);
+            const d2 = ac.dot(ap);
+            if (d1 <= 0 and d2 <= 0) return a;
+            const bp = p.sub(b);
+            const d3 = ab.dot(bp);
+            const d4 = ac.dot(bp);
+            if (d3 >= 0 and d4 <= d3) return b;
+            const vc = d1 * d4 - d3 * d2;
+            if (vc <= 0 and d1 >= 0 and d3 <= 0) return a.add(ab.scale(d1 / (d1 - d3)));
+            const cp = p.sub(c);
+            const d5 = ab.dot(cp);
+            const d6 = ac.dot(cp);
+            if (d6 >= 0 and d5 <= d6) return c;
+            const vb = d5 * d2 - d1 * d6;
+            if (vb <= 0 and d2 >= 0 and d6 <= 0) return a.add(ac.scale(d2 / (d2 - d6)));
+            const va = d3 * d6 - d5 * d4;
+            if (va <= 0 and d4 - d3 >= 0 and d5 - d6 >= 0) return b.add(c.sub(b).scale((d4 - d3) / ((d4 - d3) + (d5 - d6))));
+            const scale = 1 / (va + vb + vc);
+            return a.add(ab.scale(vb * scale)).add(ac.scale(vc * scale));
         }
 
         fn closer(best: ?Hit, next: ?Hit) ?Hit {
@@ -111,7 +223,7 @@ pub fn Casts(comptime S: type) type {
         }
 
         /// Everywhere `shape` at `pose` passes moving `max_m` along `direction`.
-        fn sweptBounds(shape: Shape, pose: Pose, direction: Vec, max_m: T) S.Aabb {
+        pub fn sweptBounds(shape: Shape, pose: Pose, direction: Vec, max_m: T) S.Aabb {
             const start = shape.aabb(pose);
             var end_pose = pose;
             end_pose.translation = pose.translation.add(direction.scale(max_m));

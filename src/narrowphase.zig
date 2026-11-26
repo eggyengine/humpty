@@ -125,6 +125,14 @@ pub fn Narrowphase(comptime S: type) type {
         /// A convex shape whose world bounds are `bounds` against one facet in world space.
         fn convexFacet(out: *Manifold, a: Placed, bounds: S.Aabb, facet: [S.n]Vec) void {
             if (!bounds.overlaps(S.Aabb.around(&facet))) return;
+            // The facet's own plane: a shape wholly to one side has a gap, which GJK would find
+            // the slow way. Most cells under a resting shape end here.
+            if (S.n == 3) {
+                const normal = facet[1].sub(facet[0]).cross(facet[2].sub(facet[0]));
+                const offset = normal.dot(facet[0]);
+                if (a.support(normal.negate()).dot(normal) > offset) return;
+                if (a.support(normal).dot(normal) < offset) return;
+            }
             convexConvex(out, a, Points{ .points = &facet }, a.shape == .ball);
         }
 

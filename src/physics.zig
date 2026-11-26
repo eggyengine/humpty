@@ -121,6 +121,8 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
         /// so after the first few steps the solver stops asking `gpa` for memory.
         placed: std.ArrayList(Placed) = .empty,
         pairs: std.ArrayList(ColliderPair) = .empty,
+        /// `placed` by where each begins along x, for `findPairs`.
+        sweep: std.ArrayList(u32) = .empty,
         constraints: std.ArrayList(Solver.Constraint) = .empty,
         rows: std.ArrayList(Joints.Row) = .empty,
         contact_list: std.ArrayList(Contact) = .empty,
@@ -181,6 +183,7 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
             self.vehicles.deinit(self.gpa);
             self.placed.deinit(self.gpa);
             self.pairs.deinit(self.gpa);
+            self.sweep.deinit(self.gpa);
             self.constraints.deinit(self.gpa);
             self.rows.deinit(self.gpa);
             self.contact_list.deinit(self.gpa);
@@ -359,14 +362,17 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
                 state.angular = S.angularScale(state.angular, 1 / (1 + state.angular_damping * dt_s));
             }
 
+            // Placed before the vehicles, whose wheels cast against them: nothing moves till the
+            // bodies are integrated, so their poses and bounds hold for the whole step.
+            try self.placeColliders();
+
             // Vehicles push off the ground through their wheels, from where gravity left them.
             if (three) for (self.vehicles.entries.items) |*entry| {
                 const vehicle = &(entry.item orelse continue).item;
                 const chassis = &(self.bodies.get(vehicle.body) orelse continue).item;
-                Vehicles.step(vehicle, chassis, dt_s, WheelCaster{ .world = self, .chassis = vehicle.body });
+                Vehicles.step(vehicle, chassis, dt_s, WheelCaster{ .world = self, .chassis = chassis });
             };
 
-            try self.placeColliders();
             try self.findPairs();
 
             // Narrowphase: each overlapping pair's contacts, and a constraint for each to solve.
@@ -447,14 +453,23 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
                 S.angularLengthSquared(state.angular) > sleep_angular_radps * sleep_angular_radps);
         }
 
-        /// How vehicles cast their wheels: a ball the wheel's size, past their own chassis and
-        /// through sensors.
+        /// How vehicles cast their wheels, inside a step: a ball the wheel's size, past their own
+        /// chassis and through sensors, against the colliders placed this step and their bounds.
         const WheelCaster = struct {
             world: *Self,
-            chassis: b.BodyHandle,
+            chassis: *const State,
 
             pub fn castWheel(self: WheelCaster, from: Vec, direction: Vec, max_m: T, radius_m: T) ?Vehicles.Contact {
-                const hit = self.world.shapecast(.{ .ball = .{ .radius = radius_m } }, Pose.fromTranslation(from), direction, max_m, .{ .exclude_body = self.chassis, .sensors = .skip }) orelse return null;
+                const shape: Shape = .{ .ball = .{ .radius = radius_m } };
+                const start = Pose.fromTranslation(from);
+                const swept = Casts.sweptBounds(shape, start, direction, max_m);
+                var nearest: ?ShapeHit = null;
+                for (self.world.placed.items) |placed| {
+                    if (placed.collider.sensor or !swept.overlaps(placed.bounds)) continue;
+                    if (placed.body) |body| if (body == self.chassis) continue;
+                    castInto(&nearest, placed.handle, shape, start, direction, max_m, placed.collider.shape, placed.pose);
+                }
+                const hit = nearest orelse return null;
                 const ground = if (self.world.colliderBody(hit.collider)) |handle| &self.world.bodies.get(handle).?.item else null;
                 return .{ .collider = hit.collider, .ground = ground, .point = hit.point, .normal = hit.normal, .distance_m = hit.distance_m };
             }
@@ -490,14 +505,34 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
             }
         }
 
-        // ponytail: every pair is tested, O(n²); add a sweep-and-prune or tree past a few hundred colliders.
+        /// Sweep and prune along x: in order of where they begin, each collider is tested only
+        /// against those that begin before it ends.
         fn findPairs(self: *Self) !void {
-            for (self.placed.items, 0..) |a, i| {
-                for (self.placed.items[i + 1 ..], i + 1..) |bb, j| {
+            const placed = self.placed.items;
+            self.sweep.clearRetainingCapacity();
+            try self.sweep.ensureTotalCapacity(self.gpa, placed.len);
+            for (0..placed.len) |i| self.sweep.appendAssumeCapacity(@intCast(i));
+            std.sort.pdq(u32, self.sweep.items, placed, beginsBefore);
+            for (self.sweep.items, 0..) |i, at| {
+                const a = placed[i];
+                const ends = S.get(a.bounds.max, 0);
+                for (self.sweep.items[at + 1 ..]) |j| {
+                    const bb = placed[j];
+                    if (S.get(bb.bounds.min, 0) > ends) break;
                     if (!canTouch(a, bb) or !a.bounds.overlaps(bb.bounds)) continue;
-                    try self.pairs.append(self.gpa, .{ .a = @intCast(i), .b = @intCast(j) });
+                    try self.pairs.append(self.gpa, .{ .a = @min(i, j), .b = @max(i, j) });
                 }
             }
+            // In the order testing every pair found them, so contacts are solved as before.
+            std.sort.pdq(ColliderPair, self.pairs.items, {}, pairBefore);
+        }
+
+        fn beginsBefore(placed: []const Placed, a: u32, bb: u32) bool {
+            return S.get(placed[a].bounds.min, 0) < S.get(placed[bb].bounds.min, 0);
+        }
+
+        fn pairBefore(_: void, a: ColliderPair, bb: ColliderPair) bool {
+            return a.a < bb.a or (a.a == bb.a and a.b < bb.b);
         }
 
         /// Whether two colliders can meet: not on the same body, and one of them moves (or senses).
@@ -971,22 +1006,31 @@ pub fn Physics(comptime dim: space.Dim, comptime T: type) type {
         pub fn shapecast(self: *const Self, shape: Shape, start: Pose, direction: Vec, max_distance_m: T, filter: QueryFilter) ?ShapeHit {
             if (!shape.convex() or !shape.supported()) return null;
             var nearest: ?ShapeHit = null;
+            // Boxes first: a cast is dozens of GJK runs, and most colliders are far off.
+            const swept = Casts.sweptBounds(shape, start, direction, max_distance_m);
             for (self.colliders.entries.items, 0..) |entry, index| {
                 const attached = entry.item orelse continue;
                 const handle = self.colliders.handleAt(index);
                 const placed_pose = self.queryPose(handle, attached, filter) orelse continue;
-                const reach = if (nearest) |hit| hit.distance_m else max_distance_m;
-                const hit = Casts.cast(shape, start, direction, reach, attached.item.shape, placed_pose) orelse continue;
-                if (nearest != null and nearest.?.distance_m <= hit.distance_m) continue;
-                nearest = .{
-                    .collider = handle,
-                    .point = hit.point,
-                    .normal = hit.normal,
-                    .distance_m = hit.distance_m,
-                    .time_of_impact = if (max_distance_m > 0) hit.distance_m / max_distance_m else 0,
-                };
+                if (!swept.overlaps(attached.item.shape.aabb(placed_pose))) continue;
+                castInto(&nearest, handle, shape, start, direction, max_distance_m, attached.item.shape, placed_pose);
             }
             return nearest;
+        }
+
+        /// Cast `shape` at collider `handle` (`target` at `target_pose`), keeping the hit in
+        /// `nearest` when it is nearer than the one there.
+        fn castInto(nearest: *?ShapeHit, handle: c.ColliderHandle, shape: Shape, start: Pose, direction: Vec, max_distance_m: T, target: Shape, target_pose: Pose) void {
+            const reach = if (nearest.*) |hit| hit.distance_m else max_distance_m;
+            const hit = Casts.cast(shape, start, direction, reach, target, target_pose) orelse return;
+            if (nearest.*) |kept| if (kept.distance_m <= hit.distance_m) return;
+            nearest.* = .{
+                .collider = handle,
+                .point = hit.point,
+                .normal = hit.normal,
+                .distance_m = hit.distance_m,
+                .time_of_impact = if (max_distance_m > 0) hit.distance_m / max_distance_m else 0,
+            };
         }
     };
 }

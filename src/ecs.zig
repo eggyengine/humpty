@@ -610,6 +610,12 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
             while (query.next()) |view| {
                 const entity = view.entity;
                 const collider = view.get(*const Collider).*;
+                // Switched off and otherwise as it was (most far-off scenery): nothing asks where
+                // it is, and switching it on again catches up with any move.
+                if (!collider.enabled) if (world.get(entity, Link)) |link| if (link.source) |old| {
+                    const live = if (link.collider) |handle| res.world.contains(handle) else false;
+                    if (live and !old.enabled and std.meta.eql(old, collider)) continue;
+                };
                 const place = Host.place(world, entity, view.get(*const Host.Transform).*);
                 const owner = ownerOf(world, entity);
                 const owner_body: ?BodyHandle = if (owner) |found| if (world.get(found, Link)) |owner_link| owner_link.body else null else null;
@@ -633,7 +639,7 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
                 } else {
                     if (link.source.?.enabled != collider.enabled) res.world.setColliderEnabled(link.collider.?, collider.enabled);
                     link.source = collider;
-                    if (!samePose(link.collider_pose, pose)) {
+                    if (!samePose(link.collider_pose, pose, place.position.length())) {
                         res.world.setColliderPose(link.collider.?, pose);
                         link.collider_pose = pose;
                     }
@@ -654,11 +660,17 @@ pub fn Plugin(comptime dim: space.Dim, comptime T: type, comptime Host: type) ty
 
         /// Whether two collider poses differ by less than the noise of working them out from
         /// transforms again, so a child collider isn't moved, and its body woken, every frame.
-        fn samePose(a: World.Pose, b: World.Pose) bool {
-            const near_m: T = 1e-5;
+        /// That noise grows with `far_m`, how far from the origin the collider is.
+        fn samePose(a: World.Pose, b: World.Pose, far_m: f32) bool {
+            const near_m: T = @max(1e-5, std.math.floatEps(f32) * 8 * far_m);
             if (a.translation.sub(b.translation).lengthSquared() > near_m * near_m) return false;
-            if (two) return @abs(a.rotation.angle() - b.rotation.angle()) < 1e-5;
-            return @abs(@reduce(.Add, a.rotation.quat.v * b.rotation.quat.v)) > 1 - 1e-9;
+            const near_rad: T = 1e-5;
+            if (two) return @abs(a.rotation.angle() - b.rotation.angle()) < near_rad;
+            // q and -q are the same turn; apart, they differ by about half the angle between.
+            // (Their dot product can't tell: 1 - 1e-9 is 1 in f32.)
+            const apart = a.rotation.quat.v - b.rotation.quat.v;
+            const across = a.rotation.quat.v + b.rotation.quat.v;
+            return @min(@reduce(.Add, apart * apart), @reduce(.Add, across * across)) < near_rad * near_rad;
         }
 
         /// Builds `collider`'s shape and attaches it to `body` (scenery when null) at `pose`.
