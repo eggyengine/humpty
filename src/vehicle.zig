@@ -22,6 +22,7 @@ pub fn Vehicles(comptime S: type) type {
 
     return struct {
         pub const max_wheels = 16;
+        pub const max_gears = 8;
 
         /// The whole vehicle's drive. Forces are shared among the wheels that take them. The
         /// defaults drive a 3000 kg truck.
@@ -41,6 +42,30 @@ pub fn Vehicles(comptime S: type) type {
             drag_n_s2_per_m2: T = 2.5,
             /// At this speed, in m/s, steering turns the wheels half as far; 0 keeps them turning fully.
             steer_falloff_mps: T = 25,
+            /// Forward gears, lowest first, each as many times top gear's pull as it gives: in
+            /// gear `i` (from 1) the engine pushes up to `engine_force_n * gear_ratios[i - 1]`,
+            /// fading out towards that gear's top speed, `max_speed_mps / gear_ratios[i - 1]`.
+            /// The first zero ends the list; none at all is one gear, pushing evenly up to
+            /// `max_speed_mps`, with no clutch. Reverse uses first gear's ratio.
+            gear_ratios: [max_gears]T = @splat(0),
+            /// Shifts by itself; otherwise only as `Vehicle.shift` asks. Either way it shifts
+            /// into reverse, and back, when stopped and the throttle asks to go the other way.
+            automatic: bool = true,
+            /// How long the clutch is out on each shift, with nothing driving the wheels, in s.
+            shift_s: T = 0.5,
+            /// Shifting by itself, up past this share of a gear's top speed (with the throttle
+            /// down), and down below this share.
+            shift_up_share: T = 0.9,
+            shift_down_share: T = 0.4,
+            /// The engine's speed idling and at the top of each gear, in rpm, for its readers.
+            idle_rpm: T = 800,
+            max_rpm: T = 2600,
+
+            /// How many forward gears it has; 0 without a gearbox.
+            pub fn gearCount(self: Config) u8 {
+                for (self.gear_ratios, 0..) |ratio, i| if (!(ratio > 0)) return @intCast(i);
+                return max_gears;
+            }
         };
 
         pub const WheelConfig = struct {
@@ -126,6 +151,25 @@ pub fn Vehicles(comptime S: type) type {
             speed_mps: T = 0,
             /// The input it last stepped with: asleep, it wakes when that changes.
             stepped_input: Input = .{},
+            /// The gear it is in: 1 and up forward, -1 reverse. Without gears, always 1.
+            gear: i8 = 1,
+            /// While the clutch is out, the gear it is shifting into, and how long until it is in.
+            shifting_to: i8 = 1,
+            shift_left_s: T = 0,
+            /// The engine's speed, in rpm (`Config.idle_rpm` to `max_rpm`).
+            rpm: T = 0,
+            /// A shift asked for and not yet made: 1 up, -1 down. `shift` sets it.
+            shift_asked: i8 = 0,
+
+            /// Asks for the next gear up (`1`) or down (`-1`) without `Config.automatic`.
+            pub fn shift(self: *Vehicle, way: i8) void {
+                self.shift_asked = std.math.sign(way);
+            }
+
+            /// Whether the clutch is out, mid-shift.
+            pub fn shifting(self: *const Vehicle) bool {
+                return self.shift_left_s > 0;
+            }
 
             pub fn wheelSlice(self: *Vehicle) []Wheel {
                 return self.wheels[0..self.wheel_count];
@@ -170,7 +214,7 @@ pub fn Vehicles(comptime S: type) type {
             const input = vehicle.input.clamped();
             defer vehicle.stepped_input = input;
             if (chassis.sleeping and chassis.enabled) {
-                if (std.meta.eql(input, vehicle.stepped_input)) return;
+                if (std.meta.eql(input, vehicle.stepped_input) and vehicle.shift_asked == 0) return;
                 chassis.wake();
             }
             if (!chassis.pushable()) return;
@@ -193,9 +237,7 @@ pub fn Vehicles(comptime S: type) type {
                 if (wheel.config.brakes) braking += 1;
                 if (wheel.config.handbrake) holding += 1;
             }
-            const top_speed = if (input.throttle >= 0) config.max_speed_mps else config.max_speed_mps * config.reverse_factor;
-            const pushing = if (@abs(speed) < top_speed or std.math.sign(speed) != std.math.sign(input.throttle)) input.throttle else 0;
-            const engine_n = config.engine_force_n * pushing * (if (input.throttle < 0) config.reverse_factor else 1);
+            const engine_n = drive(vehicle, input, speed, dt_s);
 
             // Suspension: where each wheel meets the ground, and how hard its spring pushes there.
             var contacts: [max_wheels]?Contact = @splat(null);
@@ -298,6 +340,92 @@ pub fn Vehicles(comptime S: type) type {
                 }
                 state.spin_rad = @mod(state.spin_rad + state.spin_rad_per_s * dt_s, std.math.tau);
             }
+        }
+
+        /// The engine's push along the vehicle this step, in N (backwards when negative), with
+        /// the gearbox shifted as it needs.
+        fn drive(vehicle: *Vehicle, input: Input, speed: T, dt_s: T) T {
+            const config = vehicle.config;
+            const gears = config.gearCount();
+            if (gears == 0) {
+                vehicle.gear = 1;
+                vehicle.shift_asked = 0;
+                const top_speed = if (input.throttle >= 0) config.max_speed_mps else config.max_speed_mps * config.reverse_factor;
+                const pushing = if (@abs(speed) < top_speed or std.math.sign(speed) != std.math.sign(input.throttle)) input.throttle else 0;
+                vehicle.rpm = config.idle_rpm + (config.max_rpm - config.idle_rpm) * std.math.clamp(@abs(speed) / top_speed, 0, 1);
+                return config.engine_force_n * pushing * (if (input.throttle < 0) config.reverse_factor else 1);
+            }
+            vehicle.gear = std.math.clamp(vehicle.gear, -1, @as(i8, @intCast(gears)));
+            if (vehicle.gear == 0) vehicle.gear = 1;
+
+            // The clutch is out: nothing drives, and the engine falls to the next gear's speed.
+            if (vehicle.shift_left_s > 0) {
+                vehicle.shift_asked = 0;
+                const target = rpmIn(config, vehicle.shifting_to, speed, input.throttle);
+                vehicle.rpm += (target - vehicle.rpm) * @min(dt_s / vehicle.shift_left_s, 1);
+                vehicle.shift_left_s -= dt_s;
+                if (vehicle.shift_left_s <= 0) {
+                    vehicle.shift_left_s = 0;
+                    vehicle.gear = vehicle.shifting_to;
+                }
+                return 0;
+            }
+
+            const want = nextGear(vehicle, input, speed, gears);
+            vehicle.shift_asked = 0;
+            if (want != vehicle.gear and config.shift_s > 0) {
+                vehicle.shifting_to = want;
+                vehicle.shift_left_s = config.shift_s;
+                return 0;
+            }
+            vehicle.gear = want;
+            vehicle.rpm = rpmIn(config, vehicle.gear, speed, input.throttle);
+
+            // Full pull until 85% of the gear's top speed, fading to none at it.
+            const share = gearShare(config, vehicle.gear, speed);
+            const pull = std.math.clamp((1 - share) / 0.15, 0, 1);
+            const ratio = config.gear_ratios[0];
+            return if (vehicle.gear > 0)
+                config.engine_force_n * config.gear_ratios[@intCast(vehicle.gear - 1)] * pull * @max(input.throttle, 0)
+            else
+                -config.engine_force_n * ratio * config.reverse_factor * pull * @max(-input.throttle, 0);
+        }
+
+        /// The gear to be in: reverse and back when stopped and the throttle asks to go the
+        /// other way, else the driver's ask or, shifting by itself, by speed.
+        fn nextGear(vehicle: *const Vehicle, input: Input, speed: T, gears: u8) i8 {
+            const config = vehicle.config;
+            const gear = vehicle.gear;
+            const stopped_mps = 0.5;
+            if (gear > 0 and input.throttle < -0.05 and speed < stopped_mps) return -1;
+            if (gear < 0 and input.throttle > 0.05 and speed > -stopped_mps) return 1;
+            if (gear < 0) return gear;
+            if (!config.automatic) return std.math.clamp(gear + vehicle.shift_asked, 1, @as(i8, @intCast(gears)));
+            const share = gearShare(config, gear, speed);
+            if (share > config.shift_up_share and gear < gears and input.throttle > 0.05) return gear + 1;
+            if (share < config.shift_down_share and gear > 1) {
+                // Straight to the highest gear that has the engine back in its range.
+                var lower = gear - 1;
+                while (lower > 1 and gearShare(config, lower, speed) < config.shift_down_share) lower -= 1;
+                return lower;
+            }
+            return gear;
+        }
+
+        /// How far through `gear`'s speeds `speed` is: 0 stopped, 1 at its top.
+        fn gearShare(config: Config, gear: i8, speed: T) T {
+            if (gear < 0) return @max(-speed, 0) / (config.max_speed_mps * config.reverse_factor / config.gear_ratios[0]);
+            const ratio = config.gear_ratios[@intCast(gear - 1)];
+            return @max(speed, 0) / (config.max_speed_mps / ratio);
+        }
+
+        /// The engine's speed in `gear` at `speed`: with the throttle down and slow, it slips
+        /// the clutch and revs up to a third of its range.
+        fn rpmIn(config: Config, gear: i8, speed: T, throttle: T) T {
+            const range = config.max_rpm - config.idle_rpm;
+            const turning = std.math.clamp(gearShare(config, gear, speed), 0, 1);
+            const slipping = @abs(throttle) * 0.35;
+            return config.idle_rpm + range * @max(turning, slipping);
         }
 
         /// Anti-roll bars: each pair of wheels on an axle shares the difference in how far
@@ -422,6 +550,67 @@ test "a truck settles at its loaded suspension height, reaches 25 m/s on a heigh
     const stopped_in = braking_from - world.pose(truck.body).translation.z;
     try std.testing.expect(stopped_in > 28 and stopped_in < 38);
     try std.testing.expect(world.velocity(truck.body).linear.length() < 0.05);
+}
+
+test "a truck with a gearbox pulls hardest in first, shifts up through its gears with the clutch out between, and backs up in reverse" {
+    var world = try TestWorld.init(std.testing.allocator, .{ .gravity = TestVec.init(0, -9.81, 0), .fixed_step_s = 1.0 / 120.0 });
+    defer world.deinit();
+    _ = try world.addCollider(.{ .shape = .{ .cuboid = .{ .half_extents = TestVec.init(50, 1, 800) } }, .local_pose = TestWorld.Pose.fromTranslation(TestVec.init(0, -1, -700)) }, null, 0);
+    const truck = try addVehicle(&world, TestWorld.Pose.fromTranslation(TestVec.init(0, 1.2, 0)), .truck);
+    const vehicle = world.vehicleOf(truck.vehicle).?;
+    vehicle.config.engine_force_n = 6000;
+    vehicle.config.gear_ratios[0..4].* = .{ 3.5, 2.2, 1.45, 1 };
+    vehicle.config.shift_s = 0.5;
+    try stepFor(&world, 2);
+    try std.testing.expectEqual(@as(i8, 1), vehicle.gear);
+
+    // First gear: 21 kN on 3 t is about 7 m/s² before rolling and drag.
+    vehicle.input = .{ .throttle = 1 };
+    try stepFor(&world, 1);
+    try std.testing.expect(vehicle.speed_mps > 5.5 and vehicle.speed_mps < 7.5);
+
+    // It reaches every gear, and over each shift, with the clutch out, it slows.
+    var highest: i8 = 1;
+    var shifts: usize = 0;
+    var clutch_gain: f32 = -std.math.inf(f32);
+    var shift_from: f32 = 0;
+    var seconds: f32 = 0;
+    while (seconds < 40 and vehicle.speed_mps < 27) : (seconds += 1.0 / 120.0) {
+        const before = vehicle.speed_mps;
+        const was_shifting = vehicle.shifting();
+        try world.update(1.0 / 120.0);
+        if (!was_shifting and vehicle.shifting()) {
+            shifts += 1;
+            shift_from = before;
+        }
+        if (was_shifting and !vehicle.shifting()) clutch_gain = @max(clutch_gain, vehicle.speed_mps - shift_from);
+        highest = @max(highest, vehicle.gear);
+    }
+    try std.testing.expect(vehicle.speed_mps >= 27);
+    try std.testing.expectEqual(@as(i8, 4), highest);
+    try std.testing.expectEqual(@as(usize, 3), shifts);
+    try std.testing.expect(clutch_gain < 0);
+    try std.testing.expect(vehicle.rpm > vehicle.config.idle_rpm and vehicle.rpm <= vehicle.config.max_rpm);
+
+    // Brake to a stop: it drops back to first. Then throttle back: it shifts into reverse.
+    vehicle.input = .{ .brake = 1 };
+    try stepFor(&world, 6);
+    try std.testing.expectEqual(@as(i8, 1), vehicle.gear);
+    vehicle.input = .{ .throttle = -1 };
+    try stepFor(&world, 2);
+    try std.testing.expectEqual(@as(i8, -1), vehicle.gear);
+    try std.testing.expect(vehicle.speed_mps < -2);
+
+    // Shifting by hand, it stays in the gear asked for.
+    vehicle.input = .{ .brake = 1 };
+    try stepFor(&world, 3);
+    vehicle.config.automatic = false;
+    vehicle.input = .{ .throttle = 1 };
+    try stepFor(&world, 3);
+    try std.testing.expectEqual(@as(i8, 1), vehicle.gear);
+    vehicle.shift(1);
+    try stepFor(&world, 1);
+    try std.testing.expectEqual(@as(i8, 2), vehicle.gear);
 }
 
 test "a truck tows a trailer on a ball hitch through a tight turn, and both hold still on a slope with their handbrakes on" {

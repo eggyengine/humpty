@@ -32,6 +32,21 @@ pub const Vehicle = struct {
     drag_n_s2_per_m2: f32 = 2.5,
     /// At this speed steering turns the wheels half as far; 0 keeps them turning fully.
     steer_falloff_mps: f32 = 25,
+    /// Forward gears, lowest first, each as many times top gear's pull as it gives: in gear
+    /// `i` (from 1) the engine pushes up to `engine_force_n * gear_ratios[i - 1]`, fading out
+    /// towards `max_speed_mps / gear_ratios[i - 1]`. The first zero ends the list; none at all
+    /// is one gear, pushing evenly up to `max_speed_mps`. Reverse uses first gear's ratio.
+    gear_ratios: [8]f32 = @splat(0),
+    /// Shifts by itself; otherwise as `VehicleInput.shift` asks.
+    automatic: bool = true,
+    /// How long the clutch is out on each shift, with nothing driving the wheels.
+    shift_s: f32 = 0.5,
+    /// Shifting by itself, up past this share of a gear's top speed, and down below this.
+    shift_up_share: f32 = 0.9,
+    shift_down_share: f32 = 0.4,
+    /// The engine's speed idling and at the top of each gear, for `VehicleState.rpm`.
+    idle_rpm: f32 = 800,
+    max_rpm: f32 = 2600,
 };
 
 /// What the driver asks of a `Vehicle`, set by the game.
@@ -44,6 +59,9 @@ pub const VehicleInput = struct {
     /// 0 to 1.
     brake: f32 = 0,
     handbrake: bool = false,
+    /// Set to 1 for the next gear up or -1 for the next down (without `Vehicle.automatic`);
+    /// physics takes it and sets it back to 0.
+    shift: i8 = 0,
 };
 
 /// How a `Vehicle` went in the last step, kept up to date by physics: add it to read it.
@@ -51,6 +69,14 @@ pub const VehicleState = struct {
     pub const category = "Physics";
     /// Forward speed in m/s, negative reversing.
     speed_mps: f32 = 0,
+    /// 1 and up forward, -1 reverse; always 1 without gears.
+    gear: i8 = 1,
+    /// How many forward gears it has; 0 without a gearbox.
+    gear_count: u8 = 0,
+    /// The clutch is out, shifting into `shifting_to`.
+    shifting: bool = false,
+    shifting_to: i8 = 1,
+    rpm: f32 = 0,
 };
 
 /// A wheel of the `Vehicle` above it, its suspension mounted where this entity is. It needs no
@@ -146,7 +172,7 @@ pub fn Sync(comptime P: type) type {
                 }
                 const vehicle = res.world.vehicleOf(link.handle.?).?;
                 vehicle.config = configOf(view.get(*const Vehicle).*);
-                if (world.get(entity, VehicleInput)) |input| vehicle.input = inputOf(input.*);
+                if (world.get(entity, VehicleInput)) |input| take(vehicle, input);
                 gatherWheels(world, entity, view.get(*const P.PluginHost.Transform).*, vehicle, link);
             }
             for (fresh.items) |made| try world.addComponent(made.entity, made.link);
@@ -200,11 +226,18 @@ pub fn Sync(comptime P: type) type {
         /// Hands each vehicle its `VehicleInput`, as a `FixedStep` may have set it.
         pub fn readInput(world: *clutch.World) void {
             const res = world.getResource(P.Resource) orelse return;
-            var query = world.query(.{ *const Link, *const VehicleInput });
+            var query = world.query(.{ *const Link, *VehicleInput });
             while (query.next()) |view| {
                 const vehicle = res.world.vehicleOf(view.get(*const Link).handle orelse continue) orelse continue;
-                vehicle.input = inputOf(view.get(*const VehicleInput).*);
+                take(vehicle, view.get(*VehicleInput));
             }
+        }
+
+        /// Hands `vehicle` the driver's `input`, taking a shift it asks for.
+        fn take(vehicle: *World.Vehicle, input: *VehicleInput) void {
+            vehicle.input = inputOf(input.*);
+            if (input.shift != 0) vehicle.shift(input.shift);
+            input.shift = 0;
         }
 
         /// Fills `VehicleState`s and `WheelState`s, and places each wheel's visual.
@@ -213,7 +246,14 @@ pub fn Sync(comptime P: type) type {
             while (query.next()) |view| {
                 const link = view.get(*const Link);
                 const vehicle = res.world.vehicleOf(link.handle orelse continue) orelse continue;
-                if (world.get(view.entity, VehicleState)) |state| state.speed_mps = @floatCast(vehicle.speed_mps);
+                if (world.get(view.entity, VehicleState)) |state| state.* = .{
+                    .speed_mps = @floatCast(vehicle.speed_mps),
+                    .gear = vehicle.gear,
+                    .gear_count = vehicle.config.gearCount(),
+                    .shifting = vehicle.shifting(),
+                    .shifting_to = vehicle.shifting_to,
+                    .rpm = @floatCast(vehicle.rpm),
+                };
                 if (!res.world.contains(link.body)) continue;
                 const chassis = res.world.pose(link.body);
                 const turn = P.fromRotation(chassis.rotation);
@@ -251,6 +291,17 @@ pub fn Sync(comptime P: type) type {
                 .rolling_resistance = vehicle.rolling_resistance,
                 .drag_n_s2_per_m2 = vehicle.drag_n_s2_per_m2,
                 .steer_falloff_mps = vehicle.steer_falloff_mps,
+                .gear_ratios = ratios: {
+                    var ratios: [Vehicles.max_gears]T = undefined;
+                    for (&ratios, vehicle.gear_ratios) |*to, from| to.* = from;
+                    break :ratios ratios;
+                },
+                .automatic = vehicle.automatic,
+                .shift_s = vehicle.shift_s,
+                .shift_up_share = vehicle.shift_up_share,
+                .shift_down_share = vehicle.shift_down_share,
+                .idle_rpm = vehicle.idle_rpm,
+                .max_rpm = vehicle.max_rpm,
             };
         }
 
