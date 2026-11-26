@@ -1,0 +1,25 @@
+src/narrowphase.zig
+  s_998bfe1ed6a70f::t_ca1124dba4ecea 128-135
+src/ecs.zig
+  s_998bfe1ed6a70f::t_d23b793b4c0b57 613-618,642,663-665,667-673
+src/physics.zig
+  s_998bfe1ed6a70f::t_c37b4cb3a226c5 124-125,186,365-368,373,456-457,460,463-472,508-509,511-521,523,526-535,1009-1010,1015-1016,1020-1034
+src/shapecast.zig
+  s_998bfe1ed6a70f::t_3ed0b3ea77f290 104-108,112-218,226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "b38f390ec3e10c48404d99ff99858827a83baf9a",
+  "prompts": {},
+  "sessions": {
+    "s_998bfe1ed6a70f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7500c0d0-b23c-423e-8069-894aa8b948d1",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Thribhu K <me@tirbo.fish>"
+    }
+  }
+}
